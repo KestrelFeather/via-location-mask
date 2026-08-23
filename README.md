@@ -4,6 +4,8 @@
 
 本项目与 Via Browser 或 GeoSpoof 无隶属、认可或合作关系。它不会修改 Android 系统 GPS、系统语言、公网 IP，也不会连接或切换 VPN。
 
+https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-location-mask.user.js
+
 ## 安装
 
 1. 下载并在 Via 中打开 `via-location-mask.user.js`。
