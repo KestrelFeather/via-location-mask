@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.2
+// @version      1.0.3
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,26 +60,21 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.2";
+  const VERSION = "1.0.3";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
-  const INSTANCE_TOKEN_KEY = "via-location-mask.instance-token.v1";
+  const INSTANCE_MARKS_KEY = "via-location-mask.instances.v1";
 
-  // Independent injections (a re-injected document, or same-origin frames that
-  // run their own copy) share function names and patched realms. Nothing is
-  // stored on page-visible objects: the state is only returned by a masked
-  // Function.prototype.toString called with a per-install secret that lives in
-  // userscript storage.
-  const instanceToken = readInstanceToken();
-  const sharedState = probeSharedState(window, null) || findAncestorSharedState() || {
-    nativeToString: Function.prototype.toString,
-    names: new WeakMap(),
-    realms: new WeakSet(),
-    instances: new WeakSet(),
-  };
-  if (sharedState.instances.has(document)) return;
-  sharedState.instances.add(document);
+  // Instances never share objects: anything handed between them could be
+  // intercepted by a page that wrapped the functions involved. A re-injected
+  // document is recognized through userscript storage alone, and each instance
+  // keeps its own function-name registry (see createMaskedToString).
+  if (!claimDocument()) return;
+  const initialToString = Function.prototype.toString;
+  // A toString from another realm means an ancestor frame's instance already
+  // patched this realm (a Window reused for a new document).
+  const realmPrePatched = !(initialToString instanceof Function);
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
     latitude: 25.033,
@@ -106,78 +101,104 @@
   });
 
   const originals = {
-    functionToString: sharedState.nativeToString,
+    functionToString: initialToString,
     functionCall: Function.prototype.call,
   };
-  const overrideRegistry = sharedState.names;
+  const overrideRegistry = new WeakMap();
+  const patchedRealms = new WeakSet();
+  // Function.prototype objects of realms this instance has seen; masks only
+  // look for another instance's mask on these, never on arbitrary (possibly
+  // proxied) prototypes a page can attach to its own functions.
+  const knownRealms = collectKnownRealms();
+  // Source text shared by every mask this script version installs, read with a
+  // native toString; used to recognize masks without ever calling page code.
+  const maskSource = realmPrePatched
+    ? null
+    : Reflect.apply(initialToString, createMaskedToString(initialToString, "", ""), []);
   const syntheticWatchStops = new Set();
   const coordsSlots = new WeakMap();
   const positionSlots = new WeakMap();
   let paddedCoordinateCache = null;
   let settings = readSettings();
 
-  function readInstanceToken() {
+  function claimDocument() {
     try {
-      const saved = typeof GM_getValue === "function" ? GM_getValue(INSTANCE_TOKEN_KEY, "") : "";
-      if (typeof saved === "string" && /^[0-9a-f]{32}$/.test(saved)) return saved;
+      if (typeof GM_getValue !== "function" || typeof GM_setValue !== "function") return true;
+      // Hashed so the marks never keep a readable browsing history.
+      const key = hashText(location.href + "|" + performance.timeOrigin);
+      const saved = GM_getValue(INSTANCE_MARKS_KEY, null);
+      const marks = Array.isArray(saved) ? saved : typeof saved === "string" ? JSON.parse(saved) : [];
+      if (!Array.isArray(marks)) return true;
+      if (marks.includes(key)) return false;
+      GM_setValue(INSTANCE_MARKS_KEY, JSON.stringify([key].concat(marks).slice(0, 200)));
     } catch (_) {
-      // Fall through to a per-instance token.
+      // Without a mark a re-injection only layers a second, still consistent patch.
     }
-    const words = new Uint32Array(4);
-    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
-      globalThis.crypto.getRandomValues(words);
-    } else {
-      for (let index = 0; index < words.length; index += 1) {
-        words[index] = Math.floor(Math.random() * 0x100000000);
-      }
-    }
-    const token = Array.from(words, (word) => word.toString(16).padStart(8, "0")).join("");
-    try {
-      if (typeof GM_setValue === "function") GM_setValue(INSTANCE_TOKEN_KEY, token);
-    } catch (_) {
-      // The token then only links instances that read it before the failure.
-    }
-    return token;
+    return true;
   }
 
+  function hashText(text) {
+    let first = 0xdeadbeef;
+    let second = 0x41c6ce57;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      first = Math.imul(first ^ code, 2654435761);
+      second = Math.imul(second ^ code, 1597334677);
+    }
+    first = Math.imul(first ^ (first >>> 16), 2246822507) ^ Math.imul(second ^ (second >>> 13), 3266489909);
+    second = Math.imul(second ^ (second >>> 16), 2246822507) ^ Math.imul(first ^ (first >>> 13), 3266489909);
+    return (4294967296 * (2097151 & second) + (first >>> 0)).toString(36);
+  }
+
+  // Masks the realm's Function.prototype.toString. Wrappers registered by
+  // another instance (for example one running inside a same-origin frame) are
+  // not in this registry, so they are named by the mask on the wrapper's own
+  // realm, after that mask is recognized by its native source text.
   function createMaskedToString(nativeToString, nativePrefix, nativeSuffix) {
-    return {
+    let delegating = false;
+    const maskedToString = {
       toString() {
-        if (arguments.length === 1 && arguments[0] === instanceToken) return sharedState;
         const name = overrideRegistry.get(this);
         if (name !== undefined) return nativePrefix + name + nativeSuffix;
-        return Reflect.apply(nativeToString, this, []);
+        const source = Reflect.apply(nativeToString, this, []);
+        // Native functions, bound functions and proxies need no lookup, and
+        // skipping them keeps proxy traps from observing the calls below.
+        if (delegating || !maskSource || /\[native code\]\s*\}$/.test(source)) return source;
+        const prototype = Reflect.getPrototypeOf(this);
+        if (!knownRealms.has(prototype)) return source;
+        const descriptor = Reflect.getOwnPropertyDescriptor(prototype, "toString");
+        const owner = descriptor && descriptor.value;
+        if (typeof owner !== "function" || owner === maskedToString ||
+            Reflect.apply(nativeToString, owner, []) !== maskSource) return source;
+        delegating = true;
+        try {
+          return Reflect.apply(owner, this, []);
+        } finally {
+          delegating = false;
+        }
       },
     }.toString;
+    return maskedToString;
   }
 
-  // Returns the shared state behind a realm's masked toString. With a native
-  // toString, the candidate is first checked to be this script's mask so the
-  // secret is never handed to a page-installed function.
-  function probeSharedState(realm, nativeToString) {
-    try {
-      const candidate = realm.Function.prototype.toString;
-      if (nativeToString) {
-        const expected = Reflect.apply(nativeToString, createMaskedToString(null, "", ""), []);
-        if (Reflect.apply(nativeToString, candidate, []) !== expected) return null;
-      }
-      const state = Reflect.apply(candidate, candidate, [instanceToken]);
-      return state && typeof state === "object" && state.realms ? state : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function findAncestorSharedState() {
+  function collectKnownRealms() {
+    const realms = new WeakSet([Function.prototype]);
     try {
       for (let owner = window; owner.parent !== owner; owner = owner.parent) {
-        const state = probeSharedState(owner.parent, Function.prototype.toString);
-        if (state) return state;
+        realms.add(owner.parent.Function.prototype);
       }
     } catch (_) {
       // Stop at the first cross-origin boundary.
     }
-    return null;
+    return realms;
+  }
+
+  function realmMasked(functionPrototype) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(functionPrototype, "toString");
+    const current = descriptor && descriptor.value;
+    if (typeof current !== "function") return false;
+    if (overrideRegistry.has(current)) return true;
+    return !!maskSource && Reflect.apply(initialToString, current, []) === maskSource;
   }
 
   function log(...args) {
@@ -2402,11 +2423,12 @@
     } catch (_) {
       return false;
     }
-    if (!realmKey || sharedState.realms.has(realmKey)) return false;
-    const foreignState = probeSharedState(realm, sharedState.nativeToString);
-    if (foreignState && foreignState.realms.has(realmKey)) return false;
+    if (!realmKey || patchedRealms.has(realmKey)) return false;
+    patchedRealms.add(realmKey);
+    knownRealms.add(realmKey);
+    // Another instance (inside that frame, or a re-injection) already owns it.
+    if (realmMasked(realmKey)) return false;
     try {
-      sharedState.realms.add(realmKey);
       installFunctionMaskingOn(realm);
       installEnvironmentOverrides(realm);
       installWorkerPatching(realm);
@@ -3704,7 +3726,7 @@
     }
   }
 
-  patchWindow(window);
+  if (!realmPrePatched) patchWindow(window);
   installIframeCoverage();
   registerMenus();
   installAutoVpnSync();
