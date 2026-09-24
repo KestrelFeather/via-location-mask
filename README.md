@@ -47,6 +47,18 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置和缓存。
 
+## v1.0.2 修复
+
+- 移除 v1.0.1 挂在页面 `document` 上的公开 `Symbol.for` 标记。多个注入实例改为通过仅存于脚本存储的随机令牌共享状态；网页既无法枚举，也无法篡改补丁记录。
+- 伪装的定位权限对象不再带有自有属性；`state`、`name`、`onchange` 改由原型访问器提供，外观与原生一致。
+- 修复公元前年份的显示（如 `-0001`），以及 `setYear` 和 `new Date(y, m)` 对小数两位数年份的处理。
+- `Date#toString` 的时区名称改用与 V8 相同的规则（当前标准/夏令时名称），历史日期不再显示为 `GMT+09:18:59`。
+- 本地时间字符串恰好落在真实时区夏令时空档内时，解析结果不再偏差 1 小时。
+- 修复 Worker 中的 `toDateString`、`toTimeString` 未被伪装的问题；Worker 与主页面改用同一套时区实现。
+- 同一全局对象换页后不再重复包装 Worker 等 API；降低 `navigator.languages` 和日期取值的开销。
+
+桌面 Chromium 回归对 10 个时区（含历史 LMT、公元前日期、夏令时空档）逐项对照原生结果，主页面与 Worker 共 900 项全部一致。
+
 ## v1.0.1 修复
 
 - 修复 VPN 自动同步后的 Date/Intl 时区不一致，以及 `navigator.languages` 沿用旧设置。
