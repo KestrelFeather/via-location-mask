@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.3
+// @version      1.0.4
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,7 +60,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.3";
+  const VERSION = "1.0.4";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -75,6 +75,10 @@
   // A toString from another realm means an ancestor frame's instance already
   // patched this realm (a Window reused for a new document).
   const realmPrePatched = !(initialToString instanceof Function);
+  // Captured before page code runs; a page can shadow window.length but not
+  // this native getter, and indexed child access on a WindowProxy is unhookable.
+  const nativeWindowLength = Object.getOwnPropertyDescriptor(window, "length").get;
+  const nativeFunctionSource = Reflect.apply(initialToString, Function, []);
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
     latitude: 25.033,
@@ -106,15 +110,19 @@
   };
   const overrideRegistry = new WeakMap();
   const patchedRealms = new WeakSet();
-  // Function.prototype objects of realms this instance has seen; masks only
-  // look for another instance's mask on these, never on arbitrary (possibly
-  // proxied) prototypes a page can attach to its own functions.
-  const knownRealms = collectKnownRealms();
-  // Source text shared by every mask this script version installs, read with a
-  // native toString; used to recognize masks without ever calling page code.
-  const maskSource = realmPrePatched
-    ? null
-    : Reflect.apply(initialToString, createMaskedToString(initialToString, "", ""), []);
+  // Genuine Function.prototype objects of same-origin realms in this tab. Masks
+  // only look for another instance's mask on these, never on arbitrary
+  // (possibly proxied) prototypes a page can attach to its own functions.
+  const knownRealms = new WeakSet([Function.prototype]);
+  // Source text shared by every mask this script version installs; used to
+  // recognize masks without ever calling page code. When an ancestor's mask
+  // is already installed here it still reports this unregistered function's
+  // real source.
+  const maskSource = Reflect.apply(
+    initialToString,
+    createMaskedToString(initialToString, "", ""),
+    []
+  );
   const syntheticWatchStops = new Set();
   const coordsSlots = new WeakMap();
   const positionSlots = new WeakMap();
@@ -165,6 +173,8 @@
         // skipping them keeps proxy traps from observing the calls below.
         if (delegating || !maskSource || /\[native code\]\s*\}$/.test(source)) return source;
         const prototype = Reflect.getPrototypeOf(this);
+        // Frames (siblings included) may have appeared since the last walk.
+        if (!knownRealms.has(prototype)) discoverRealms();
         if (!knownRealms.has(prototype)) return source;
         const descriptor = Reflect.getOwnPropertyDescriptor(prototype, "toString");
         const owner = descriptor && descriptor.value;
@@ -181,16 +191,50 @@
     return maskedToString;
   }
 
-  function collectKnownRealms() {
-    const realms = new WeakSet([Function.prototype]);
+  // Reads a window's Function.prototype without running page code: the
+  // property is read as a descriptor, and the constructor must be the genuine
+  // native Function (a proxy or page function stringifies differently).
+  function genuineFunctionPrototype(realm) {
     try {
-      for (let owner = window; owner.parent !== owner; owner = owner.parent) {
-        realms.add(owner.parent.Function.prototype);
-      }
+      const descriptor = Reflect.getOwnPropertyDescriptor(realm, "Function");
+      const constructor = descriptor && descriptor.value;
+      if (typeof constructor !== "function" ||
+          Reflect.apply(initialToString, constructor, []) !== nativeFunctionSource) return null;
+      const prototypeDescriptor = Reflect.getOwnPropertyDescriptor(constructor, "prototype");
+      return prototypeDescriptor ? prototypeDescriptor.value : null;
     } catch (_) {
-      // Stop at the first cross-origin boundary.
+      return null;  // Cross-origin.
     }
-    return realms;
+  }
+
+  // Records every same-origin realm in the tab, walking the frame tree from
+  // the unforgeable window.top through cross-origin frames as well.
+  function discoverRealms() {
+    const visit = (frame, depth) => {
+      const prototype = genuineFunctionPrototype(frame);
+      if (prototype) knownRealms.add(prototype);
+      if (depth > 32) return;
+      let count = 0;
+      try {
+        count = Reflect.apply(nativeWindowLength, frame, []);
+      } catch (_) {
+        return;
+      }
+      for (let index = 0; index < count; index += 1) {
+        let child;
+        try {
+          child = frame[index];
+        } catch (_) {
+          continue;
+        }
+        if (child) visit(child, depth + 1);
+      }
+    };
+    try {
+      visit(window.top, 0);
+    } catch (_) {
+      // Keep whatever was recorded.
+    }
   }
 
   function realmMasked(functionPrototype) {
@@ -2417,12 +2461,7 @@
     if (!realm) return false;
     // Key by the realm's intrinsics: a WindowProxy survives navigation, while a
     // Window reused for a new document keeps its already patched globals.
-    let realmKey;
-    try {
-      realmKey = realm.Function.prototype;
-    } catch (_) {
-      return false;
-    }
+    const realmKey = genuineFunctionPrototype(realm);
     if (!realmKey || patchedRealms.has(realmKey)) return false;
     patchedRealms.add(realmKey);
     knownRealms.add(realmKey);
@@ -3726,7 +3765,16 @@
     }
   }
 
-  if (!realmPrePatched) patchWindow(window);
+  discoverRealms();
+  if (!realmPrePatched) {
+    patchWindow(window);
+  } else {
+    // An ancestor's instance patched this realm, but wrappers this instance
+    // installs below (iframe coverage) live in this registry: layer a mask
+    // that names them and defers everything else to the ancestor's mask.
+    patchedRealms.add(Function.prototype);
+    installFunctionMaskingOn(window);
+  }
   installIframeCoverage();
   registerMenus();
   installAutoVpnSync();
