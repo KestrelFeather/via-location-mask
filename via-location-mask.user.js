@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.0
+// @version      1.0.1
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,7 +60,31 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.0";
+  const VERSION = "1.0.1";
+  const instanceKey = Symbol.for("via-location-mask.instance.v1");
+  if (document[instanceKey]) return;
+  Object.defineProperty(document, instanceKey, { value: true });
+
+  // Independent userscript injections in same-origin frames share ownership
+  // and function names. Documents (unlike WindowProxy) change on navigation.
+  const sharedKey = Symbol.for("via-location-mask.realms.v1");
+  let sharedDocument = document;
+  try {
+    let owner = window;
+    while (owner.parent !== owner) {
+      const parentDocument = owner.parent.document;
+      owner = owner.parent;
+      sharedDocument = parentDocument;
+    }
+  } catch (_) {
+    // Stop at the first cross-origin boundary.
+  }
+  if (!sharedDocument[sharedKey]) {
+    Object.defineProperty(sharedDocument, sharedKey, {
+      value: { names: new WeakMap(), documents: new WeakSet() },
+    });
+  }
+  const sharedRealms = sharedDocument[sharedKey];
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -93,7 +117,7 @@
     functionToString: Function.prototype.toString,
     functionCall: Function.prototype.call,
   };
-  const overrideRegistry = new WeakMap();
+  const overrideRegistry = sharedRealms.names;
   const patchedWindows = new WeakMap();
   const patchedWorkerRealms = new WeakSet();
   const maskedFunctionRealms = new WeakSet();
@@ -208,17 +232,20 @@
     const subdomainsOnly = host.startsWith("*.");
     if (subdomainsOnly) host = host.slice(2);
     const anyHost = host === "*";
-    if (!host || (!anyHost && host.includes("*")) || host.includes(":")) return null;
+    const ipv6 = host.startsWith("[") && host.endsWith("]");
+    if (!host || (!anyHost && host.includes("*")) || (!ipv6 && host.includes(":"))) return null;
+    if (ipv6 && subdomainsOnly) return null;
     let exactHostOnly = false;
     if (!anyHost) {
       try {
-        host = new URL("http://" + host).hostname.toLowerCase();
+        const parsedHost = new URL("http://" + host);
+        if (parsedHost.username || parsedHost.password || parsedHost.port) return null;
+        host = parsedHost.hostname.toLowerCase();
       } catch (_) {
         return null;
       }
       const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
-      if (!ipv4 && host !== "localhost" && !host.includes(".") && !subdomainsOnly) return null;
-      exactHostOnly = ipv4 || host === "localhost";
+      exactHostOnly = ipv4 || ipv6 || !host.includes(".");
     }
     if (pathPattern && !pathPattern.startsWith("/")) return null;
     const pathRegex = pathPattern
@@ -863,7 +890,7 @@
   }
 
   function installFunctionMaskingOn(realm) {
-    if (!realm || !realm.Function || maskedFunctionRealms.has(realm)) return;
+    if (!realm || !realm.Function || maskedFunctionRealms.has(realm.Function.prototype)) return;
     const functionPrototype = realm.Function.prototype;
     const nativeToString = functionPrototype.toString;
     const numberSource = Reflect.apply(nativeToString, realm.Number, []);
@@ -880,11 +907,7 @@
     registerOverride(maskedToString, "toString");
     disguiseAsNative(maskedToString, "toString", 0);
     functionPrototype.toString = maskedToString;
-    maskedFunctionRealms.add(realm);
-  }
-
-  function installFunctionMasking() {
-    installFunctionMaskingOn(window);
+    maskedFunctionRealms.add(functionPrototype);
   }
 
   function coordinateHash01(seed, latitude, longitude, salt) {
@@ -983,7 +1006,8 @@
     if (![degrees, minutes, seconds].every(Number.isFinite) ||
         minutes < 0 || minutes >= 60 || seconds < 0 || seconds >= 60) return null;
     const magnitude = Math.abs(degrees) + minutes / 60 + seconds / 3600;
-    const negative = hemisphere === "S" || hemisphere === "W" || (!hemisphere && degrees < 0);
+    const negative = hemisphere === "S" || hemisphere === "W" ||
+      (!hemisphere && (degrees < 0 || Object.is(degrees, -0)));
     return { value: negative ? -magnitude : magnitude, axis };
   }
 
@@ -1245,7 +1269,12 @@
     let cached = null;
 
     function getCached(options) {
-      const maximumAge = options && finiteNumber(options.maximumAge, 0);
+      const requestedAge = options == null ? undefined : options.maximumAge;
+      const rawAge = requestedAge === undefined ? 0 : +requestedAge;
+      const clampedAge = Number.isNaN(rawAge) ? 0 : Math.min(0xffffffff, Math.max(0, rawAge));
+      const floorAge = Math.floor(clampedAge);
+      const maximumAge = clampedAge - floorAge === 0.5
+        ? floorAge + (floorAge % 2) : Math.round(clampedAge);
       if (!cached || maximumAge <= 0) return null;
       return Date.now() - cached.createdAt <= maximumAge ? cached.position : null;
     }
@@ -1312,9 +1341,8 @@
         try {
           success(freshPosition());
         } catch (callbackError) {
-          record.active = false;
-          syntheticWatches.delete(watchId);
-          log("watchPosition callback failed", callbackError);
+          if (typeof realm.reportError === "function") realm.reportError(callbackError);
+          else setTimeout(() => { throw callbackError; }, 0);
         }
       };
       const schedule = () => {
@@ -1367,10 +1395,12 @@
   }
 
   function createPermissionStatus(realm) {
-    const target = realm.PermissionStatus
-      ? Object.create(realm.PermissionStatus.prototype)
-      : new realm.EventTarget();
+    const target = new realm.EventTarget();
+    if (realm.PermissionStatus) Object.setPrototypeOf(target, realm.PermissionStatus.prototype);
     let onchange = null;
+    const changeListener = function (event) {
+      if (onchange) Reflect.apply(onchange, target, [event]);
+    };
     Object.defineProperties(target, {
       state: {
         value: "granted",
@@ -1387,7 +1417,10 @@
       onchange: {
         get: () => onchange,
         set: (value) => {
-          onchange = value;
+          const next = typeof value === "function" ? value : null;
+          if (!onchange && next) target.addEventListener("change", changeListener);
+          if (onchange && !next) target.removeEventListener("change", changeListener);
+          onchange = next;
         },
         enumerable: true,
         configurable: true,
@@ -1442,6 +1475,7 @@
     let Wrapped = function () {
       const args = Array.prototype.slice.call(arguments);
       const finalArgs = buildArguments(args);
+      if (!new.target) return Reflect.apply(Native, this, finalArgs);
       const target = new.target && new.target !== Wrapped ? new.target : Native;
       return Reflect.construct(Native, finalArgs, target);
     };
@@ -1491,10 +1525,16 @@
     const languagesDescriptor = Object.getOwnPropertyDescriptor(NavigatorPrototype, "languages");
     if (languagesDescriptor && typeof languagesDescriptor.get === "function") {
       const nativeGetLanguages = languagesDescriptor.get;
-      const spoofedLanguages = realm.Object.freeze(Array.from(settings.languages));
+      let languagesKey;
+      let spoofedLanguages;
       installAccessor(NavigatorPrototype, "languages", {
         get: function navigatorLanguagesGetter() {
           const nativeValue = Reflect.apply(nativeGetLanguages, this, []);
+          const nextKey = JSON.stringify(settings.languages);
+          if (nextKey !== languagesKey) {
+            spoofedLanguages = realm.Object.freeze(realm.Array.from(settings.languages));
+            languagesKey = nextKey;
+          }
           return protectionActive() && settings.localeEnabled ? spoofedLanguages : nativeValue;
         },
       });
@@ -1588,20 +1628,28 @@
   function createZoneTools(realm, NativeDate, NativeDateTimeFormat) {
     const nativeGetTime = NativeDate.prototype.getTime;
     const nativeGetUTCMilliseconds = NativeDate.prototype.getUTCMilliseconds;
-    const partsFormatter = new NativeDateTimeFormat("en-US-u-ca-gregory-nu-latn", {
-      timeZone: settings.timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-    });
-    const zoneNameFormatter = new NativeDateTimeFormat("en-US", {
-      timeZone: settings.timezone,
-      timeZoneName: "long",
-    });
+    let formatterZone;
+    let partsFormatter;
+    let zoneNameFormatter;
+    function refreshFormatters() {
+      if (formatterZone === settings.timezone) return;
+      partsFormatter = new NativeDateTimeFormat("en-US-u-ca-gregory-nu-latn", {
+        timeZone: settings.timezone,
+        era: "short",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+      });
+      zoneNameFormatter = new NativeDateTimeFormat("en-US", {
+        timeZone: settings.timezone,
+        timeZoneName: "long",
+      });
+      formatterZone = settings.timezone;
+    }
     const monthNames = [
       "Jan", "Feb", "Mar", "Apr", "May", "Jun",
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1615,11 +1663,12 @@
     function parts(value) {
       const timestamp = epoch(value);
       if (!Number.isFinite(timestamp)) return null;
+      refreshFormatters();
       const result = {};
       for (const part of partsFormatter.formatToParts(value)) {
         if (part.type !== "literal") result[part.type] = part.value;
       }
-      const year = Number(result.year);
+      const year = result.era === "BC" ? 1 - Number(result.year) : Number(result.year);
       const month = Number(result.month);
       const day = Number(result.day);
       return {
@@ -1630,7 +1679,8 @@
         minute: Number(result.minute),
         second: Number(result.second),
         millisecond: Reflect.apply(nativeGetUTCMilliseconds, value, []),
-        weekday: new NativeDate(realm.Date.UTC(year, month - 1, day)).getUTCDay(),
+        weekday: new NativeDate(wallEpoch({ year, month, day, hour: 0,
+          minute: 0, second: 0, millisecond: 0 })).getUTCDay(),
       };
     }
 
@@ -1638,16 +1688,9 @@
       const date = new NativeDate(timestamp);
       const value = parts(date);
       if (!value) return NaN;
-      const wallAsUtc = NativeDate.UTC(
-        value.year,
-        value.month - 1,
-        value.day,
-        value.hour,
-        value.minute,
-        value.second,
-        value.millisecond
-      );
-      return Math.round((timestamp - wallAsUtc) / 60000);
+      const wallAsUtc = wallEpoch(value);
+      // Keep second-level historical offsets for wall-clock conversions.
+      return (timestamp - wallAsUtc) / 60000;
     }
 
     function wallEpoch(values) {
@@ -1656,18 +1699,9 @@
         values.minute, values.second, values.millisecond,
       ].map(Number);
       if (numbers.some((value) => !Number.isFinite(value))) return NaN;
-      let year = numbers[0];
-      const safeYear = year >= 0 && year <= 99 ? 2000 : year;
-      const date = new NativeDate(NativeDate.UTC(
-        safeYear,
-        numbers[1] - 1,
-        numbers[2],
-        numbers[3],
-        numbers[4],
-        numbers[5],
-        numbers[6]
-      ));
-      if (year >= 0 && year <= 99) date.setUTCFullYear(Math.trunc(year));
+      const date = new NativeDate(0);
+      date.setUTCFullYear(numbers[0], numbers[1] - 1, numbers[2]);
+      date.setUTCHours(numbers[3], numbers[4], numbers[5], numbers[6]);
       return epoch(date);
     }
 
@@ -1723,12 +1757,13 @@
 
     function offsetText(offset) {
       const sign = offset <= 0 ? "+" : "-";
-      const absolute = Math.abs(offset);
+      const absolute = Math.abs(Math.trunc(offset));
       return sign + String(Math.floor(absolute / 60)).padStart(2, "0") +
         String(absolute % 60).padStart(2, "0");
     }
 
     function zoneName(value) {
+      refreshFormatters();
       const part = zoneNameFormatter.formatToParts(value).find((item) => item.type === "timeZoneName");
       return part ? part.value : settings.timezone;
     }
@@ -1755,11 +1790,11 @@
 
   function isAmbiguousDateString(value) {
     const source = String(value).trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(source)) return false;
+    if (/^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/.test(source)) return false;
     return !(
       /Z$/i.test(source) ||
-      /\b(?:UTC|GMT)\b/i.test(source) ||
-      /[+-]\d{2}(?::?\d{2})?$/.test(source)
+      /\b(?:UTC|GMT|[ECMP][SD]T)\b/i.test(source) ||
+      /[+-]\d{2}(?::?\d{2})?(?:\s*\([^)]*\))?$/.test(source)
     );
   }
 
@@ -1786,7 +1821,9 @@
     function currentParts(receiver, fullYearSpecial) {
       const timestamp = tools.epoch(receiver);
       if (Number.isFinite(timestamp)) return tools.parts(receiver);
-      return fullYearSpecial ? tools.parts(new NativeDate(0)) : null;
+      return fullYearSpecial
+        ? { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 }
+        : null;
     }
 
     function commit(receiver, values) {
@@ -1930,7 +1967,7 @@
         if (!item) return match;
         const offset = tools.offsetAt(timestamp);
         const sign = offset <= 0 ? "+" : "-";
-        const absolute = Math.abs(offset);
+        const absolute = Math.abs(Math.trunc(offset));
         return pad(item.year, 4) + "-" + pad(item.month, 2) + "-" + pad(item.day, 2) +
           "T" + pad(item.hour, 2) + ":" + pad(item.minute, 2) + ":" +
           pad(item.second, 2) + (fractional || "") + sign +
@@ -2035,7 +2072,9 @@
       "getTimezoneOffset",
       function getTimezoneOffset() {
         const nativeValue = Reflect.apply(nativeGetters.getTimezoneOffset, this, []);
-        return protectionActive() && settings.timezoneEnabled ? tools.offsetAt(tools.epoch(this)) : nativeValue;
+        if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
+        const offset = tools.offsetAt(tools.epoch(this));
+        return Number.isNaN(offset) ? NaN : Math.trunc(offset) || 0;
       },
       0
     );
@@ -2062,7 +2101,7 @@
       "toString",
       function toString() {
         const nativeValue = Reflect.apply(nativeGetters.toString, this, []);
-        return protectionActive() && settings.timezoneEnabled
+        return protectionActive() && settings.timezoneEnabled && Number.isFinite(tools.epoch(this))
           ? tools.dateText(this) + " " + tools.timeText(this)
           : nativeValue;
       },
@@ -2187,9 +2226,10 @@
     } catch (_) {
       return false;
     }
-    if (patchedWindows.get(realm) === documentMarker) return false;
+    if (patchedWindows.get(realm) === documentMarker || sharedRealms.documents.has(documentMarker)) return false;
     try {
       patchedWindows.set(realm, documentMarker);
+      sharedRealms.documents.add(documentMarker);
       installFunctionMaskingOn(realm);
       installEnvironmentOverrides(realm);
       installWorkerPatching(realm);
@@ -2214,6 +2254,7 @@
         Permissions: realm.Permissions,
         PermissionStatus: realm.PermissionStatus,
         EventTarget: realm.EventTarget,
+        reportError: typeof realm.reportError === "function" ? realm.reportError.bind(realm) : null,
         navigator: realm.navigator,
       };
       installGeolocationObjectModel(apiRealm);
@@ -2357,6 +2398,7 @@
           }
         }
         const target = new.target && new.target !== Wrapped ? new.target : Native;
+        if (!new.target) return Reflect.apply(Native, this, args);
         return Reflect.construct(Native, args, target);
       };
       mark(Wrapped, name, Native.length);
@@ -2402,6 +2444,7 @@
     if (config.timezoneEnabled) {
       partsFormatter = new NativeDateTimeFormat("en-US-u-ca-gregory-nu-latn", {
         timeZone: config.timezone,
+        era: "short",
         year: "numeric", month: "2-digit", day: "2-digit",
         hour: "2-digit", minute: "2-digit", second: "2-digit",
         hourCycle: "h23",
@@ -2421,7 +2464,7 @@
       for (const part of partsFormatter.formatToParts(value)) {
         if (part.type !== "literal") record[part.type] = part.value;
       }
-      const year = Number(record.year);
+      const year = record.era === "BC" ? 1 - Number(record.year) : Number(record.year);
       const month = Number(record.month);
       const day = Number(record.day);
       return {
@@ -2430,17 +2473,15 @@
         minute: Number(record.minute),
         second: Number(record.second),
         millisecond: Reflect.apply(nativeGetUTCMilliseconds, value, []),
-        weekday: new NativeDate(NativeDate.UTC(year, month - 1, day)).getUTCDay(),
+        weekday: new NativeDate(wallEpoch({ year, month, day, hour: 0,
+          minute: 0, second: 0, millisecond: 0 })).getUTCDay(),
       };
     };
     const offsetAt = (timestamp) => {
       const value = zoneParts(new NativeDate(timestamp));
       if (!value) return NaN;
-      const wall = NativeDate.UTC(
-        value.year, value.month - 1, value.day, value.hour,
-        value.minute, value.second, value.millisecond
-      );
-      return Math.round((timestamp - wall) / 60000);
+      const wall = wallEpoch(value);
+      return (timestamp - wall) / 60000;
     };
     const wallEpoch = (value) => {
       const list = [
@@ -2448,11 +2489,9 @@
         value.minute, value.second, value.millisecond,
       ].map(Number);
       if (list.some((item) => !Number.isFinite(item))) return NaN;
-      const safeYear = list[0] >= 0 && list[0] <= 99 ? 2000 : list[0];
-      const date = new NativeDate(NativeDate.UTC(
-        safeYear, list[1] - 1, list[2], list[3], list[4], list[5], list[6]
-      ));
-      if (list[0] >= 0 && list[0] <= 99) date.setUTCFullYear(Math.trunc(list[0]));
+      const date = new NativeDate(0);
+      date.setUTCFullYear(list[0], list[1] - 1, list[2]);
+      date.setUTCHours(list[3], list[4], list[5], list[6]);
       return epoch(date);
     };
     const wallToEpoch = (value) => {
@@ -2505,7 +2544,8 @@
       NativeDate.prototype.getTimezoneOffset = mark({
         getTimezoneOffset() {
           Reflect.apply(nativeOffset, this, []);
-          return offsetAt(epoch(this));
+          const offset = offsetAt(epoch(this));
+          return Number.isNaN(offset) ? NaN : Math.trunc(offset) || 0;
         },
       }.getTimezoneOffset, "getTimezoneOffset");
 
@@ -2520,7 +2560,7 @@
           if (!value) return fallback;
           const offset = offsetAt(epoch(this));
           const sign = offset <= 0 ? "+" : "-";
-          const absolute = Math.abs(offset);
+          const absolute = Math.abs(Math.trunc(offset));
           const offsetText = sign + String(Math.floor(absolute / 60)).padStart(2, "0") +
             String(absolute % 60).padStart(2, "0");
           const zonePart = zoneNameFormatter.formatToParts(this)
@@ -2540,7 +2580,7 @@
           let item = Number.isFinite(timestamp)
             ? zoneParts(receiver)
             : (property === "setFullYear" || property === "setYear"
-              ? zoneParts(new NativeDate(0))
+              ? { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 }
               : null);
           if (!item) return Reflect.apply(nativeMethod, receiver, args);
           const values = {
@@ -2594,11 +2634,11 @@
 
       const ambiguous = (value) => {
         const source = String(value).trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(source)) return false;
+        if (/^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/.test(source)) return false;
         return !(
           /Z$/i.test(source) ||
-          /\b(?:UTC|GMT)\b/i.test(source) ||
-          /[+-]\d{2}(?::?\d{2})?$/.test(source)
+          /\b(?:UTC|GMT|[ECMP][SD]T)\b/i.test(source) ||
+          /[+-]\d{2}(?::?\d{2})?(?:\s*\([^)]*\))?$/.test(source)
         );
       };
       const parseTarget = (source) => {
@@ -2743,8 +2783,8 @@
   }
 
   function installWorkerPatching(realm) {
-    if (!realm || patchedWorkerRealms.has(realm) || typeof realm.Worker !== "function") return;
-    patchedWorkerRealms.add(realm);
+    if (!realm || patchedWorkerRealms.has(realm.document) || typeof realm.Worker !== "function") return;
+    patchedWorkerRealms.add(realm.document);
     const RealWorker = realm.Worker;
     const NativeBlob = realm.Blob;
     const NativeURL = realm.URL;
@@ -3600,7 +3640,6 @@
     }
   }
 
-  installFunctionMasking();
   patchWindow(window);
   installIframeCoverage();
   registerMenus();

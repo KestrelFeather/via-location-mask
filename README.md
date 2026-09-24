@@ -29,6 +29,7 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - Via 无法同步修改 HTTP `Accept-Language`，因此语言功能默认关闭并属于实验性功能。
 - 跨域 iframe 和 Service Worker 无法覆盖，URL Worker 为实验性功能。
 - Via 没有扩展后台任务；VPN 自动同步只在至少一个网页标签运行时工作。
+- 页面运行中更新时区和语言后，Date 和新建 Intl 对象会使用当前设置；已有 Intl 实例及已启动的 Worker 保留创建时的设置，刷新页面可统一更新。
 - Via 原生设置已禁用 WebRTC，本项目不实现 WebRTC 包装。
 - “保留网站原生定位权限提示”一般应保持关闭；启用后会真实触发 Via/Android 的网站定位授权，拒绝或撤销权限可能返回 `GeolocationPositionError`。
 - 页面脚本层的修改仍可能被高级指纹检测识别，不能视为匿名工具或 VPN 的替代品。
@@ -45,6 +46,17 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 随后可能依次把该 IP 发送给一个或多个 IP 地理服务（FreeIPAPI、GeoJS、ReallyFreeGeoIP、ipinfo），成功后停止；结果缓存 30 天。
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置和缓存。
+
+## v1.0.1 修复
+
+- 修复 VPN 自动同步后的 Date/Intl 时区不一致，以及 `navigator.languages` 沿用旧设置。
+- 修复定位权限对象的事件监听、移除监听及 `onchange`；定位监听回调抛出异常后继续推送。
+- 修复 iframe 导航后的函数外观和 Worker 补丁失效，同源父子页面独立注入时共享补丁记录，防止重复包装。
+- 修复无效日期字符串、无效日期的 `setFullYear`/`setYear`、ISO 仅日期字符串、带时区缩写字符串，以及年份 0–99 和历史秒级时区偏移。
+- 修复负零度分秒坐标、内网单段主机名和 IPv6 网站规则。
+- 修复 `maximumAge: Infinity` 的缓存处理，并保持 Intl 构造器原有的普通调用、`new` 和子类行为。
+
+桌面 Chromium 回归覆盖主页面、同源 iframe、Blob/Data/Module Blob/URL Worker，并与浏览器原生的东京、纽约、柏林和 Kiritimati 时区结果对照。Via/Android 真机仍需复测；桌面通过不代表所有 WebView 版本均已验证。
 
 ## 来源与许可
 
