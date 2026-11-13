@@ -31,6 +31,7 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - Temporal、SharedWorker 仅在浏览器原生提供时包装，不会为不支持的 WebView 添加 API。同一注入实例管理的 SharedWorker 连接复用替换后的 URL；不同标签页或独立注入实例之间的共享身份无法保证。
 - iframe 的同步覆盖发生在 DOM 插入方法返回前；不保证覆盖 HTML 解析器或插入过程中已经执行的子页面脚本。MutationObserver 和 load 监听继续作为补充。
 - 强制 Trusted Types 的页面拒绝补丁 Blob URL 时，会用页面原始参数创建 Worker，以保留网站功能；该 Worker 使用原生环境，不保证时区/语言伪装。脚本不会创建宽松的 Trusted Types policy。
+- Trusted Types 回退会再次转换原始 Worker 选项，因此成功的选项 getter 可能执行两次；getter 自己抛出的异常直接返回页面，不重试。
 - Via 没有扩展后台任务；VPN 自动同步只在至少一个网页标签运行时工作。
 - 页面运行中更新时区和语言后，Date 和新建 Intl 对象会使用当前设置；已有 Intl 实例及已启动的 Worker 保留创建时的设置，刷新页面可统一更新。
 - Via 原生设置已禁用 WebRTC，本项目不实现 WebRTC 包装。
@@ -49,6 +50,13 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 随后可能依次把该 IP 发送给一个或多个 IP 地理服务（FreeIPAPI、GeoJS、ReallyFreeGeoIP、ipinfo），成功后停止；结果缓存 30 天。
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
+
+## v1.0.7 修复
+
+- 修复 URL Worker 实验选项开启时，带选项对象的 TrustedScriptURL 无法回退：改为记录选项 getter 是否抛错，而非是否被读取，兼容 Chromium 先转换选项再校验 Trusted Types 的顺序。覆盖 Worker/SharedWorker、URL/Blob，以及空选项、classic/module 类型和名称选项。
+- 每个页面在安装 iframe 拦截时保存 MutationObserver 构造器、`observe`、`takeRecords`、`disconnect` 和 MutationRecord 的 `addedNodes` getter；同步插入及长期观察器均使用保存的引用，避免安装后网页替换这些入口时观测或干扰脚本。
+
+新增 32 组回归全部通过，包含成功 getter 的二次读取、抛错 getter 不重试、主页面/iframe 中的观察器挂钩、伪造记录和逐项抛错，以及 5000 次 innerHTML 循环。既有三套测试（24、15、34 组）全部通过；环境及边界见 [测试说明](tests/README.md)。
 
 ## v1.0.6 修复
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.6
+// @version      1.0.7
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,7 +60,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.6";
+  const VERSION = "1.0.7";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -117,6 +117,7 @@
   const nativeGeoErrors = new WeakSet();
   const captureStackTrace = Error.captureStackTrace;
   const coveredIframeRealms = new WeakSet();
+  const iframeObserverApis = new WeakMap();
   const observedIframeDocuments = new WeakSet();
   const watchedIframes = new WeakSet();
   const trackedWorkerBlobs = new Map();
@@ -2630,6 +2631,20 @@
   function installIframeCoverage(realm) {
     const realmKey = genuineFunctionPrototype(realm);
     if (!realmKey) return;
+    // Keep each realm's observer intrinsics before page code can replace them.
+    // Repeated installation must reuse these captures, including the async path.
+    let observerApi = iframeObserverApis.get(realmKey);
+    if (!observerApi) {
+      const Constructor = realm.MutationObserver;
+      observerApi = {
+        Constructor,
+        observe: Constructor.prototype.observe,
+        takeRecords: Constructor.prototype.takeRecords,
+        disconnect: Constructor.prototype.disconnect,
+        addedNodes: Object.getOwnPropertyDescriptor(realm.MutationRecord.prototype, "addedNodes").get,
+      };
+      iframeObserverApis.set(realmKey, observerApi);
+    }
     const doc = realm.document;
     if (!coveredIframeRealms.has(realmKey)) {
       coveredIframeRealms.add(realmKey);
@@ -2690,21 +2705,21 @@
       // nodes. A short-lived observer records just this operation's additions;
       // takeRecords is synchronous and never scans the destination's old DOM.
       const observeInsertion = (receiver, nativeMethod, args, useParent) => {
-        const observer = new realm.MutationObserver(() => {});
+        const observer = Reflect.construct(observerApi.Constructor, [() => {}]);
         try {
           let target = receiver;
           if (useParent) target = Reflect.apply(parentNode, receiver, []) || receiver;
-          observer.observe(target, { childList: true, subtree: true });
+          Reflect.apply(observerApi.observe, observer, [target, { childList: true, subtree: true }]);
         } catch (_) { /* The native operation below owns receiver validation. */ }
         try {
           const result = Reflect.apply(nativeMethod, receiver, args);
           const frames = new Set();
-          for (const record of observer.takeRecords()) {
-            for (const node of record.addedNodes) collect(node, frames);
+          for (const record of Reflect.apply(observerApi.takeRecords, observer, [])) {
+            for (const node of Reflect.apply(observerApi.addedNodes, record, [])) collect(node, frames);
           }
           patch(frames);
           return result;
-        } finally { observer.disconnect(); }
+        } finally { Reflect.apply(observerApi.disconnect, observer, []); }
       };
       const wrapHTML = (prototype, property, useParent) => {
         const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, property);
@@ -2742,12 +2757,12 @@
     // Observe the Document itself, including document-start before <html> exists.
     if (doc && !observedIframeDocuments.has(doc)) {
       observedIframeDocuments.add(doc);
-      const observer = new realm.MutationObserver((mutations) => {
+      const observer = Reflect.construct(observerApi.Constructor, [(mutations) => {
         for (const mutation of mutations) {
-          for (const node of mutation.addedNodes) scanNodeForIframes(node);
+          for (const node of Reflect.apply(observerApi.addedNodes, mutation, [])) scanNodeForIframes(node);
         }
-      });
-      observer.observe(doc, { childList: true, subtree: true });
+      }]);
+      Reflect.apply(observerApi.observe, observer, [doc, { childList: true, subtree: true }]);
       scanNodeForIframes(doc);
     }
   }
@@ -3128,12 +3143,12 @@
         const target = new.target === WrappedWorker ? NativeWorker : new.target;
         const construct = () => Reflect.construct(NativeWorker, originalArgs, target);
         const constructPatched = () => {
-          let optionsRead = false;
+          let optionGetterThrew = false;
           const patchedArgs = args.slice();
           if (args[1] && (typeof args[1] === "object" || typeof args[1] === "function")) {
             patchedArgs[1] = new Proxy(args[1], { get(object, key) {
-              optionsRead = true;
-              return Reflect.get(object, key, object);
+              try { return Reflect.get(object, key, object); }
+              catch (error) { optionGetterThrew = true; throw error; }
             } });
           }
           try { return Reflect.construct(NativeWorker, patchedArgs, target); }
@@ -3141,7 +3156,10 @@
             // A generated Blob URL is a string, not the page's TrustedScriptURL.
             // Fall back only for the native TT sink rejection, not arbitrary
             // constructor/option errors. Never install a permissive TT policy.
-            if (!optionsRead && realm.trustedTypes && error instanceof realm.TypeError &&
+            // Chromium may convert options before checking TT. A successful
+            // getter read must not disable fallback; only a thrown getter does.
+            // Retrying original arguments can read those getters a second time.
+            if (!optionGetterThrew && realm.trustedTypes && error instanceof realm.TypeError &&
               /TrustedScriptURL/.test(error.message)) return construct();
             throw error;
           }

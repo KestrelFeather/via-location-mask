@@ -8,9 +8,21 @@ npx playwright install chromium
 node tests/browser-regressions.cjs
 node tests/date-and-realms.cjs
 node tests/review-regressions.cjs
+node tests/hardening-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.7 验证结果
+
+实际浏览器：Edge 157.0.4341.46。`hardening-regressions.cjs` 新增 32/32 组通过；既有三套分别为 24/24、15/15、34/34。语法检查和 `git diff --check` 通过。
+
+- 16 组 Trusted Types 组合：开启 URL Worker 实验选项，Worker/SharedWorker × URL/Blob × `{}`、`{type:'classic'}`、`{name:'x'}`、`{type:'module'}`；同时检查构造器子类和实际脚本运行。
+- 4 组 getter 边界：Worker 和 SharedWorker 的成功 getter 在回退时各执行两次；getter 抛出与 Trusted Types 错误消息相同的 TypeError 时仍只执行一次，并保留异常对象身份。
+- 12 组观察器挂钩：主页面和 iframe 各自安装后替换构造器、三个方法及 `addedNodes` getter；测试记录调用并返回伪造记录，以及逐个入口抛错。HTML 插入、5000 次 innerHTML 循环和异步记录处理完成后，五个挂钩计数均为 0，无页面异常，新增 iframe 即时读取仍为伪装时区。
+- 同一套 32 组在原始 v1.0.6（`f2315c1`）上有 30 组失败、2 组通过，分别复现带选项的 Trusted Types 回退和观察器可被网页替换的问题。
+
+保存的观察器引用以每个 realm 为单位，防止安装**之后**的网页替换；这不代表能恢复安装之前已经被替换的原生函数，也不宣称消除了所有脚本检测渠道。Trusted Types 回退仍使用原生 Worker 环境，且可能重复读取成功的选项 getter。Via/Android 真机尚未验证。
 
 ## v1.0.6 验证结果
 
