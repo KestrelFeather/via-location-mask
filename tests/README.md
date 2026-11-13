@@ -13,9 +13,18 @@ node tests/intrinsic-regressions.cjs
 node tests/locale-options-regressions.cjs
 node tests/locale-cache-regressions.cjs
 node tests/stack-regressions.cjs
+node tests/challenge-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.14 验证结果
+
+实际浏览器：Chromium 153（Playwright 自带）。新增 `challenge-regressions.cjs` 5/5；其余八套 30/30、3/3、4/4、8/8、32/32、15/15、24/24、34/34，共 155 组通过。使用 `VLM_SKIP_BENCH=1`。
+
+- 页面通过 Playwright 路由提供，不访问真实网络：普通页面（对照，仍伪装）；带 `Server-Timing: chlray` 的托管质询过渡页和 `challenges.cloudflare.com` 文档保持原生时区，没有菜单和页面 UI；强制 Trusted Types 的页面在首次运行和非首次运行时都没有页面异常和 CSP 违规，跨域小部件 frame 仍伪装但没有 UI 和菜单，设置面板可以打开。
+- `VLM_SOURCE` 指向 v1.0.13（`c343d52`）时 4 组失败、对照组通过。
+- 未做真实 Cloudflare 质询的 A/B 实测，也未在 Via/Android 真机验证。
 
 ## v1.0.13 验证结果
 

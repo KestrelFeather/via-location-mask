@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.13
+// @version      1.0.14
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -59,6 +59,28 @@
 
 (function () {
   "use strict";
+
+  // Cloudflare challenges (the Turnstile frame on challenges.cloudflare.com and
+  // the managed-challenge interstitial, which carries a `chlray` Server-Timing
+  // entry) only fingerprint the browser and never use a location. Spoofing has
+  // no benefit there and any detectable trace fails the challenge, so the
+  // script stays out of those documents. The page loaded after the challenge
+  // passes is a new document and is protected as usual.
+  if (isCloudflareChallenge()) return;
+
+  function isCloudflareChallenge() {
+    try {
+      if (location.hostname === "challenges.cloudflare.com") return true;
+      const entries = performance.getEntriesByType("navigation");
+      const timings = entries.length ? entries[0].serverTiming : null;
+      for (let index = 0; timings && index < timings.length; index++) {
+        if (timings[index].name === "chlray") return true;
+      }
+    } catch (_) {
+      // Without the timing data, fall through to the normal patching path.
+    }
+    return false;
+  }
 
   // Private, startup-only snapshot. Never pass this object to page callbacks.
   // The same factory is serialized into workers before their scripts execute.
@@ -474,7 +496,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.13";
+  const VERSION = "1.0.14";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -3685,7 +3707,7 @@
       zIndex: "2147483647",
     });
     const shadow = host.attachShadow({ mode: "closed" });
-    shadow.innerHTML = `
+    if (!setPanelMarkup(shadow, `
       <style>
         :host { all: initial; }
         .backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 18px;
@@ -3829,7 +3851,7 @@
           <div id="error"></div>
           <div class="actions"><button id="cancel" type="button">取消</button><button class="primary" type="submit">保存并刷新</button></div>
         </form>
-      </div>`;
+      </div>`)) return;
 
     const byId = (id) => shadow.getElementById(id);
     let workingProfiles = [];
@@ -4295,6 +4317,53 @@
     document.body.appendChild(host);
   }
 
+  // Builds UI from DOM nodes rather than an HTML string: string HTML is a
+  // Trusted Types sink, and on enforcing pages (Cloudflare challenges, many
+  // Google properties) it throws and files a CSP violation report the site sees.
+  function uiNode(tag, attributes, children) {
+    const node = document.createElement(tag);
+    const names = I.Object.keys(attributes || {}), list = children || [];
+    for (let index = 0; index < names.length; index++) node.setAttribute(names[index], attributes[names[index]]);
+    for (let index = 0; index < list.length; index++) {
+      const child = list[index];
+      node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+    }
+    return node;
+  }
+
+  function buildShadow(shadow, css, nodes) {
+    const style = document.createElement("style");
+    style.textContent = css;
+    shadow.appendChild(style);
+    for (let index = 0; index < nodes.length; index++) shadow.appendChild(nodes[index]);
+  }
+
+  // The settings panel's large static template is only set when the user opens
+  // it from the menu. A Trusted Types page rejects the string, so fall back to a
+  // policy of our own for this fixed markup; a site allowlist can still refuse it.
+  let panelPolicy = null;
+  function setPanelMarkup(shadow, markup) {
+    try {
+      shadow.innerHTML = markup;
+      return true;
+    } catch (error) {
+      if (!window.trustedTypes || typeof window.trustedTypes.createPolicy !== "function") {
+        log("Could not render the settings panel", error);
+        return false;
+      }
+    }
+    try {
+      if (!panelPolicy) {
+        panelPolicy = window.trustedTypes.createPolicy("via-location-mask-ui", { createHTML: (value) => value });
+      }
+      shadow.innerHTML = panelPolicy.createHTML(markup);
+      return true;
+    } catch (error) {
+      log("Could not render the settings panel under Trusted Types", error);
+      return false;
+    }
+  }
+
   function whenBodyAvailable(callback) {
     if (document.body) callback();
     else document.addEventListener("DOMContentLoaded", callback, { once: true });
@@ -4314,22 +4383,20 @@
         zIndex: "2147483646",
       });
       const shadow = host.attachShadow({ mode: "closed" });
-      shadow.innerHTML = `
-        <style>
-          :host { all: initial; }
-          .wrap { display: flex; align-items: stretch; border: 1px solid #64748b; border-radius: 999px;
-            overflow: hidden; box-shadow: 0 5px 20px rgba(0,0,0,.35); background: #334155;
-            font: 650 13px/1 system-ui,sans-serif; }
-          .wrap.active { border-color: #22c55e; background: #14532d; }
-          button { min-height: 42px; border: 0; color: #fff; background: transparent; font: inherit; }
-          #vlmFabOpen { padding: 0 13px 0 15px; }
-          #vlmFabClose { width: 38px; border-left: 1px solid rgba(255,255,255,.25); font-size: 17px; }
-          button:active { background: rgba(255,255,255,.16); }
-        </style>
-        <div id="vlmFabWrap" class="wrap" role="group" aria-label="Via Location Mask">
-          <button id="vlmFabOpen" type="button" aria-label="打开 Via Location Mask 设置"></button>
-          <button id="vlmFabClose" type="button" aria-label="在当前页面隐藏浮动入口">×</button>
-        </div>`;
+      buildShadow(shadow, `
+        :host { all: initial; }
+        .wrap { display: flex; align-items: stretch; border: 1px solid #64748b; border-radius: 999px;
+          overflow: hidden; box-shadow: 0 5px 20px rgba(0,0,0,.35); background: #334155;
+          font: 650 13px/1 system-ui,sans-serif; }
+        .wrap.active { border-color: #22c55e; background: #14532d; }
+        button { min-height: 42px; border: 0; color: #fff; background: transparent; font: inherit; }
+        #vlmFabOpen { padding: 0 13px 0 15px; }
+        #vlmFabClose { width: 38px; border-left: 1px solid rgba(255,255,255,.25); font-size: 17px; }
+        button:active { background: rgba(255,255,255,.16); }`,
+      [uiNode("div", { id: "vlmFabWrap", class: "wrap", role: "group", "aria-label": "Via Location Mask" }, [
+        uiNode("button", { id: "vlmFabOpen", type: "button", "aria-label": "打开 Via Location Mask 设置" }),
+        uiNode("button", { id: "vlmFabClose", type: "button", "aria-label": "在当前页面隐藏浮动入口" }, ["×"]),
+      ])]);
       const refresh = () => {
         const active = protectionActive();
         shadow.getElementById("vlmFabWrap").classList.toggle("active", active);
@@ -4360,31 +4427,36 @@
         zIndex: "2147483646",
       });
       const shadow = host.attachShadow({ mode: "closed" });
-      shadow.innerHTML = `
-        <style>
-          :host { all: initial; }
-          .backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px;
-            background: rgba(2,6,23,.70); font: 15px/1.5 system-ui,sans-serif; color: #e5e7eb; }
-          .card { box-sizing: border-box; width: min(100%, 420px); padding: 19px; border: 1px solid #334155;
-            border-radius: 16px; background: #0f172a; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
-          h2 { margin: 0 0 7px; color: #fff; font-size: 20px; }
-          p { margin: 8px 0; }
-          ol { margin: 10px 0 0; padding-left: 22px; }
-          .muted { color: #94a3b8; font-size: 12px; }
-          .actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 17px; }
-          button { border: 1px solid #475569; border-radius: 9px; padding: 10px 14px; background: #1e293b;
-            color: #fff; font: 650 14px system-ui,sans-serif; }
-          .primary { border-color: #2563eb; background: #2563eb; }
-        </style>
-        <div class="backdrop">
-          <section class="card" role="dialog" aria-modal="true" aria-labelledby="vlmWelcomeTitle">
-            <h2 id="vlmWelcomeTitle">欢迎使用 Via Location Mask</h2>
-            <p>三步开始：</p>
-            <ol><li>选择城市或填写坐标。</li><li>选择网站范围与需要的时区、语言和 Worker 功能。</li><li>打开总开关并保存刷新。</li></ol>
-            <p class="muted">它只改变网页 JavaScript 看到的值，不改变 Android GPS 或公网 IP。语言、跨域 iframe、Service Worker 和后台自动同步存在 Via 限制。</p>
-            <div class="actions"><button id="vlmOnboardingDismiss" type="button">稍后设置</button><button id="vlmOnboardingOpen" class="primary" type="button">打开设置</button></div>
-          </section>
-        </div>`;
+      buildShadow(shadow, `
+        :host { all: initial; }
+        .backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 20px;
+          background: rgba(2,6,23,.70); font: 15px/1.5 system-ui,sans-serif; color: #e5e7eb; }
+        .card { box-sizing: border-box; width: min(100%, 420px); padding: 19px; border: 1px solid #334155;
+          border-radius: 16px; background: #0f172a; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+        h2 { margin: 0 0 7px; color: #fff; font-size: 20px; }
+        p { margin: 8px 0; }
+        ol { margin: 10px 0 0; padding-left: 22px; }
+        .muted { color: #94a3b8; font-size: 12px; }
+        .actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 17px; }
+        button { border: 1px solid #475569; border-radius: 9px; padding: 10px 14px; background: #1e293b;
+          color: #fff; font: 650 14px system-ui,sans-serif; }
+        .primary { border-color: #2563eb; background: #2563eb; }`,
+      [uiNode("div", { class: "backdrop" }, [
+        uiNode("section", { class: "card", role: "dialog", "aria-modal": "true", "aria-labelledby": "vlmWelcomeTitle" }, [
+          uiNode("h2", { id: "vlmWelcomeTitle" }, ["欢迎使用 Via Location Mask"]),
+          uiNode("p", {}, ["三步开始："]),
+          uiNode("ol", {}, [
+            uiNode("li", {}, ["选择城市或填写坐标。"]),
+            uiNode("li", {}, ["选择网站范围与需要的时区、语言和 Worker 功能。"]),
+            uiNode("li", {}, ["打开总开关并保存刷新。"]),
+          ]),
+          uiNode("p", { class: "muted" }, ["它只改变网页 JavaScript 看到的值，不改变 Android GPS 或公网 IP。语言、跨域 iframe、Service Worker 和后台自动同步存在 Via 限制。"]),
+          uiNode("div", { class: "actions" }, [
+            uiNode("button", { id: "vlmOnboardingDismiss", type: "button" }, ["稍后设置"]),
+            uiNode("button", { id: "vlmOnboardingOpen", class: "primary", type: "button" }, ["打开设置"]),
+          ]),
+        ]),
+      ])]);
       const finish = () => {
         saveUiState({ ...readUiState(), onboardingSeen: true });
         host.remove();
@@ -4422,9 +4494,14 @@
     installFunctionMaskingOn(window);
   }
   installIframeCoverage(window);
-  registerMenus();
-  installAutoVpnSync();
-  installFloatingButton();
-  installOnboarding();
+  // Menus, VPN polling and page UI belong to the tab, not to every frame: in a
+  // third-party widget frame (a Turnstile challenge, an ad) they would overlay
+  // the widget and add DOM the frame's own scripts can see.
+  if (window.top === window) {
+    registerMenus();
+    installAutoVpnSync();
+    installFloatingButton();
+    installOnboarding();
+  }
   log("Installed", { version: VERSION, enabled: settings.enabled });
 })();
