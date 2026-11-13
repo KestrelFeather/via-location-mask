@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.4
+// @version      1.0.5
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,7 +60,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.4";
+  const VERSION = "1.0.5";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -103,6 +103,24 @@
     floatingButtonEnabled: false,
     debug: false,
   });
+
+  // Capture the entropy source before page code can wrap it. Do not consume
+  // the page's observable Math.random stream, even as a fallback.
+  const randomFill = window.crypto && typeof window.crypto.getRandomValues === "function"
+    ? window.crypto.getRandomValues.bind(window.crypto) : null;
+  const randomBuffer = new Uint32Array(2);
+  function randomUnit() {
+    if (!randomFill) return 0.5;
+    randomFill(randomBuffer);
+    return ((randomBuffer[0] >>> 5) * 67108864 + (randomBuffer[1] >>> 6)) / 9007199254740992;
+  }
+  const nativeGeoErrors = new WeakSet();
+  const captureStackTrace = Error.captureStackTrace;
+  const coveredIframeRealms = new WeakSet();
+  const observedIframeDocuments = new WeakSet();
+  const watchedIframes = new WeakSet();
+  const trackedWorkerBlobs = new Map();
+  const sharedWorkerUrls = new Map();
 
   const originals = {
     functionToString: initialToString,
@@ -255,12 +273,7 @@
   }
 
   function randomSeed() {
-    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
-      const seed = new Uint32Array(1);
-      globalThis.crypto.getRandomValues(seed);
-      return seed[0] || 1;
-    }
-    return Math.floor(Math.random() * 0xffffffff) + 1;
+    return Math.floor(randomUnit() * 0xffffffff) + 1;
   }
 
   function canonicalLanguage(value, fallback) {
@@ -916,12 +929,24 @@
   }
 
   function stripConstruct(fn) {
-    return {
+    const wrapper = {
       method() {
         const args = Array.prototype.slice.call(arguments);
-        return Reflect.apply(fn, this, args);
+        try {
+          return Reflect.apply(fn, this, args);
+        } catch (error) {
+          // Only errors produced by native argument validation are rewritten.
+          // Page-thrown values (including option getters) retain their identity
+          // and original stack. V8's boundary also works for anonymous Via evals.
+          if (nativeGeoErrors.has(error) && captureStackTrace) {
+            nativeGeoErrors.delete(error);
+            try { captureStackTrace(error, wrapper); } catch (_) {}
+          }
+          throw error;
+        }
       },
     }.method;
+    return wrapper;
   }
 
   function disguiseAsNative(fn, nativeName, expectedLength) {
@@ -1205,7 +1230,7 @@
 
   function padCoordinate(raw) {
     if (decimalPlaces(raw) >= 7) return raw;
-    return Math.round((raw + (Math.random() - 0.5) * 1e-7) * 1e8) / 1e8;
+    return Math.round((raw + (randomUnit() - 0.5) * 1e-7) * 1e8) / 1e8;
   }
 
   function getPaddedCoordinates() {
@@ -1364,7 +1389,12 @@
     const forwarded = Array.prototype.slice.call(args);
     if (typeof forwarded[0] === "function") forwarded[0] = function noop() {};
     if (typeof forwarded[1] === "function") forwarded[1] = function noop() {};
-    return Reflect.apply(nativeMethod, receiver, forwarded);
+    try {
+      return Reflect.apply(nativeMethod, receiver, forwarded);
+    } catch (error) {
+      if (error && typeof error === "object") nativeGeoErrors.add(error);
+      throw error;
+    }
   }
 
   function deliver(callback, value, delay) {
@@ -1375,7 +1405,7 @@
 
   function buildGeolocationOverrides(realm, native) {
     const syntheticWatches = new Map();
-    let nextWatchId = 1000000000 + Math.floor(Math.random() * 100000000);
+    let nextWatchId = 1000000000 + Math.floor(randomUnit() * 100000000);
     let cached = null;
 
     function getCached(options) {
@@ -1396,7 +1426,7 @@
     }
 
     function emitSpoofed(success) {
-      deliver(success, freshPosition(), 10 + Math.random() * 40);
+      deliver(success, freshPosition(), 10 + randomUnit() * 40);
     }
 
     function getCurrentPosition(success, error, options) {
@@ -1460,12 +1490,12 @@
         record.timer = setTimeout(() => {
           emit();
           schedule();
-        }, 1000 + Math.random() * 1000);
+        }, 1000 + randomUnit() * 1000);
       };
       record.timer = setTimeout(() => {
         emit();
         schedule();
-      }, 10 + Math.random() * 40);
+      }, 10 + randomUnit() * 40);
 
       const stop = () => {
         record.active = false;
@@ -1478,7 +1508,7 @@
     }
 
     function clearWatch(watchId) {
-      if (realm.Geolocation && !(this instanceof realm.Geolocation)) {
+      if (!arguments.length || (realm.Geolocation && !(this instanceof realm.Geolocation))) {
         return reproduceNativeError(native.clearWatch, this, arguments);
       }
       const record = syntheticWatches.get(Number(watchId));
@@ -2448,6 +2478,29 @@
     });
   }
 
+  // Shared by windows and worker payloads. Explicit zones, including invalid
+  // arguments, are delegated unchanged; only an omitted/undefined zone defaults.
+  function patchTemporalNow(realm, getTimezone, install) {
+    const now = realm.Temporal && realm.Temporal.Now;
+    if (!now) return;
+    for (const property of [
+      "timeZoneId", "plainDateTimeISO", "plainDateISO", "plainTimeISO", "zonedDateTimeISO",
+    ]) {
+      const nativeMethod = now[property];
+      if (typeof nativeMethod !== "function") continue;
+      const method = {
+        [property]() {
+          const timezone = getTimezone();
+          if (property === "timeZoneId" && timezone) return timezone;
+          const args = Array.prototype.slice.call(arguments);
+          if (property !== "timeZoneId" && args[0] === undefined && timezone) args[0] = timezone;
+          return Reflect.apply(nativeMethod, this, args);
+        },
+      }[property];
+      install(now, property, method);
+    }
+  }
+
   function installEnvironmentOverrides(realm) {
     const NativeDate = realm.Date;
     const NativeDateTimeFormat = realm.Intl && realm.Intl.DateTimeFormat;
@@ -2455,6 +2508,8 @@
     installDateOverrides(realm, NativeDate, NativeDateTimeFormat);
     installIntlOverrides(realm);
     installLocaleMethods(realm);
+    patchTemporalNow(realm, () => protectionActive() && settings.timezoneEnabled
+      ? settings.timezone : null, installOverride);
   }
 
   function patchWindow(realm) {
@@ -2471,6 +2526,7 @@
       installFunctionMaskingOn(realm);
       installEnvironmentOverrides(realm);
       installWorkerPatching(realm);
+      installIframeCoverage(realm);
       if (!realm.navigator || !realm.navigator.geolocation || !realm.Geolocation) {
         log("Patched locale/timezone-only realm");
         return true;
@@ -2519,6 +2575,8 @@
     } catch (_) {
       // Cross-origin frame: inaccessible by design.
     }
+    if (watchedIframes.has(iframe)) return;
+    watchedIframes.add(iframe);
     iframe.addEventListener(
       "load",
       () => {
@@ -2533,50 +2591,93 @@
   }
 
   function scanNodeForIframes(node) {
-    if (!node || node.nodeType !== 1) return;
+    if (!node || ![1, 9, 11].includes(node.nodeType)) return;
     if (String(node.tagName).toUpperCase() === "IFRAME") tryPatchIframe(node);
     if (typeof node.querySelectorAll === "function") {
       for (const iframe of node.querySelectorAll("iframe")) tryPatchIframe(iframe);
     }
   }
 
-  function installIframeCoverage() {
-    if (typeof HTMLIFrameElement !== "undefined") {
-      for (const property of ["contentWindow", "contentDocument"]) {
-        const descriptor = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, property);
-        if (!descriptor || typeof descriptor.get !== "function") continue;
-        const nativeGetter = descriptor.get;
-        installAccessor(HTMLIFrameElement.prototype, property, {
-          get: function iframeRealmGetter() {
-            const value = Reflect.apply(nativeGetter, this, []);
-            try {
-              const iframeWindow =
-                property === "contentWindow" ? value : value && value.defaultView;
-              if (iframeWindow) patchWindow(iframeWindow);
-            } catch (_) {
-              // Cross-origin frame.
-            }
-            return value;
-          },
-        });
+  function installIframeCoverage(realm) {
+    const realmKey = genuineFunctionPrototype(realm);
+    if (!realmKey) return;
+    const doc = realm.document;
+    if (!coveredIframeRealms.has(realmKey)) {
+      coveredIframeRealms.add(realmKey);
+      if (realm.HTMLIFrameElement) {
+        for (const property of ["contentWindow", "contentDocument"]) {
+          const target = realm.HTMLIFrameElement.prototype;
+          const descriptor = Object.getOwnPropertyDescriptor(target, property);
+          if (!descriptor || typeof descriptor.get !== "function") continue;
+          installAccessor(target, property, {
+            get: function iframeRealmGetter() {
+              const value = Reflect.apply(descriptor.get, this, []);
+              try {
+                patchWindow(property === "contentWindow" ? value : value && value.defaultView);
+              } catch (_) {}
+              return value;
+            },
+          });
+        }
       }
-    }
 
-    const startObserver = () => {
-      if (!document.documentElement) return;
-      for (const iframe of document.querySelectorAll("iframe")) tryPatchIframe(iframe);
-      const observer = new MutationObserver((mutations) => {
+      // Scan after the native operation, before returning to the caller. Scanning
+      // the destination also catches DocumentFragments (emptied by insertion).
+      const scan = (node) => { try { scanNodeForIframes(node); } catch (_) {} };
+      const wrap = (prototype, property) => {
+        const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, property);
+        if (!descriptor || typeof descriptor.value !== "function") return;
+        const scanParent = ["before", "after", "replaceWith", "insertAdjacentElement", "insertAdjacentHTML"].includes(property);
+        installOverride(prototype, property, function domInsertion() {
+          const parent = scanParent && this && this.parentNode;
+          const result = Reflect.apply(descriptor.value, this, arguments);
+          scan(this);
+          scan(parent);
+          return result;
+        });
+      };
+      for (const property of ["appendChild", "insertBefore", "replaceChild"]) {
+        wrap(realm.Node && realm.Node.prototype, property);
+      }
+      for (const constructor of [realm.Element, realm.Document, realm.DocumentFragment,
+        realm.CharacterData, realm.DocumentType]) {
+        for (const property of ["append", "prepend", "replaceChildren", "before", "after",
+          "replaceWith", "insertAdjacentElement", "insertAdjacentHTML"]) {
+          wrap(constructor && constructor.prototype, property);
+        }
+      }
+      for (const constructor of [realm.Element, realm.ShadowRoot]) {
+        const prototype = constructor && constructor.prototype;
+        if (!prototype) continue;
+        for (const property of ["innerHTML", "outerHTML"]) {
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+          if (!descriptor || typeof descriptor.set !== "function") continue;
+          installAccessor(prototype, property, {
+            set: function iframeHTMLSetter(value) {
+              const parent = property === "outerHTML" && this && this.parentNode;
+              Reflect.apply(descriptor.set, this, [value]);
+              scan(this);
+              scan(parent);
+            },
+          });
+        }
+      }
+      for (const property of ["write", "writeln"]) wrap(realm.Document.prototype, property);
+    }
+    // Observe the Document itself, including document-start before <html> exists.
+    if (doc && !observedIframeDocuments.has(doc)) {
+      observedIframeDocuments.add(doc);
+      const observer = new realm.MutationObserver((mutations) => {
         for (const mutation of mutations) {
           for (const node of mutation.addedNodes) scanNodeForIframes(node);
         }
       });
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-    };
-    if (document.documentElement) startObserver();
-    else document.addEventListener("DOMContentLoaded", startObserver, { once: true });
+      observer.observe(doc, { childList: true, subtree: true });
+      scanNodeForIframes(doc);
+    }
   }
 
-  function workerBootstrap(config, createZoneTools) {
+  function workerBootstrap(config, createZoneTools, patchTemporalNow) {
     "use strict";
     const nativeToString = Function.prototype.toString;
     const nativeNames = new WeakMap();
@@ -2597,6 +2698,14 @@
           Reflect.apply(nativeToString, this, []);
       },
     }.toString, "toString");
+
+    patchTemporalNow(self, () => config.timezoneEnabled ? config.timezone : null,
+      (target, property, method) => {
+        const descriptor = Object.getOwnPropertyDescriptor(target, property);
+        Object.defineProperty(target, property, {
+          ...descriptor, value: mark(method, property, descriptor.value.length),
+        });
+      });
 
     const defaultLocales = (locales) =>
       locales === undefined || (Array.isArray(locales) && locales.length === 0);
@@ -2893,7 +3002,7 @@
       baseUrl: baseUrl || location.href,
     };
     return "(" + callOriginalToString(workerBootstrap) + ")(" + JSON.stringify(config) + ", " +
-      callOriginalToString(createZoneTools) + ");";
+      callOriginalToString(createZoneTools) + ", " + callOriginalToString(patchTemporalNow) + ");";
   }
 
   function decodeDataWorker(url) {
@@ -2909,103 +3018,100 @@
   }
 
   function installWorkerPatching(realm) {
-    if (!realm || typeof realm.Worker !== "function") return;
-    const RealWorker = realm.Worker;
+    if (!realm || (typeof realm.Worker !== "function" && typeof realm.SharedWorker !== "function")) return;
     const NativeBlob = realm.Blob;
     const NativeURL = realm.URL;
     if (!NativeBlob || !NativeURL || typeof NativeURL.createObjectURL !== "function") return;
     const nativeCreateObjectURL = NativeURL.createObjectURL;
     const nativeRevokeObjectURL = NativeURL.revokeObjectURL;
-    const trackedBlobs = new Map();
 
-    installOverride(
-      NativeURL,
-      "createObjectURL",
-      function createObjectURL(value) {
-        const url = Reflect.apply(nativeCreateObjectURL, NativeURL, [value]);
-        if (value instanceof NativeBlob) trackedBlobs.set(url, value);
-        return url;
-      },
-      1
-    );
-    installOverride(
-      NativeURL,
-      "revokeObjectURL",
-      function revokeObjectURL(url) {
-        trackedBlobs.delete(String(url));
-        return Reflect.apply(nativeRevokeObjectURL, NativeURL, [url]);
-      },
-      1
-    );
-
-    function patchedBlobUrl(parts) {
-      const blob = new NativeBlob(parts, { type: "text/javascript" });
-      return Reflect.apply(nativeCreateObjectURL, NativeURL, [blob]);
-    }
-
-    let WrappedWorker = function Worker(scriptURL, options) {
-      if (!new.target) return Reflect.apply(RealWorker, this, arguments);
-      if (
-        !protectionActive() ||
-        !settings.workerEnabled ||
-        (!settings.localeEnabled && !settings.timezoneEnabled)
-      ) {
-        return new RealWorker(scriptURL, options);
+    installOverride(NativeURL, "createObjectURL", function createObjectURL(value) {
+      const url = Reflect.apply(nativeCreateObjectURL, NativeURL, [value]);
+      if (value instanceof NativeBlob) trackedWorkerBlobs.set(url, value);
+      return url;
+    }, 1);
+    installOverride(NativeURL, "revokeObjectURL", function revokeObjectURL(url) {
+      const rawUrl = String(url);
+      const result = Reflect.apply(nativeRevokeObjectURL, NativeURL, [rawUrl]);
+      trackedWorkerBlobs.delete(rawUrl);
+      const patched = sharedWorkerUrls.get(rawUrl);
+      if (patched) {
+        Reflect.apply(nativeRevokeObjectURL, NativeURL, [patched]);
+        sharedWorkerUrls.delete(rawUrl);
       }
-      const rawUrl = String(scriptURL);
-      const isModule = !!(options && options.type === "module");
-      try {
+      return result;
+    }, 1);
+
+    for (const property of ["Worker", "SharedWorker"]) {
+      const NativeWorker = realm[property];
+      if (typeof NativeWorker !== "function") continue;
+      const shared = property === "SharedWorker";
+      const WrappedWorker = function (scriptURL, options) {
+        if (!new.target) return Reflect.apply(NativeWorker, this, arguments);
+        const args = Array.prototype.slice.call(arguments);
+        const target = new.target === WrappedWorker ? NativeWorker : new.target;
+        const construct = () => Reflect.construct(NativeWorker, args, target);
+        if (!args.length || !protectionActive() || !settings.workerEnabled ||
+          (!settings.localeEnabled && !settings.timezoneEnabled)) return construct();
+        const rawUrl = String(scriptURL);
+        args[0] = rawUrl;
+        const cacheKey = new NativeURL(rawUrl, realm.location.href).href;
+        if (shared && sharedWorkerUrls.has(cacheKey)) {
+          args[0] = sharedWorkerUrls.get(cacheKey);
+          return construct();
+        }
+        let parts;
         if (rawUrl.startsWith("blob:")) {
-          const originalBlob = trackedBlobs.get(rawUrl);
-          if (!originalBlob) return new RealWorker(scriptURL, options);
-          const payload = buildWorkerPayload(realm.location.href);
-          return new RealWorker(patchedBlobUrl([payload, "\n", originalBlob]), options);
-        }
-        if (rawUrl.startsWith("data:")) {
+          const blob = trackedWorkerBlobs.get(rawUrl);
+          if (!blob) return construct();
+          parts = [buildWorkerPayload(realm.location.href), "\n", blob];
+        } else if (rawUrl.startsWith("data:")) {
           const source = decodeDataWorker(rawUrl);
-          if (source == null) return new RealWorker(scriptURL, options);
-          return new RealWorker(
-            patchedBlobUrl([buildWorkerPayload(realm.location.href), "\n", source]),
-            options
-          );
-        }
-        if (settings.patchUrlWorkers) {
-          const absoluteUrl = new NativeURL(rawUrl, realm.location.href).href;
+          if (source == null) return construct();
+          parts = [buildWorkerPayload(realm.location.href), "\n", source];
+        } else if (settings.patchUrlWorkers) {
+          const absoluteUrl = cacheKey;
+          // Cache the type read so a native dictionary conversion doesn't invoke
+          // a page's getter twice. SharedWorker's string-name overload stays intact.
+          const type = options && options.type;
+          if (options && typeof options === "object") {
+            args[1] = new Proxy(options, { get(object, key) {
+              return key === "type" ? type : Reflect.get(object, key, object);
+            } });
+          }
           const payload = buildWorkerPayload(absoluteUrl);
-          const bootstrap = isModule
-            ? payload + "\nimport " + JSON.stringify(absoluteUrl) + ";"
-            : payload + "\nimportScripts(" + JSON.stringify(absoluteUrl) + ");";
-          return new RealWorker(patchedBlobUrl([bootstrap]), options);
-        }
-      } catch (error) {
-        log("Worker wrapping failed; using native Worker", error);
-      }
-      return new RealWorker(scriptURL, options);
-    };
-    registerOverride(WrappedWorker, "Worker");
-    disguiseAsNative(WrappedWorker, "Worker", RealWorker.length);
-    Object.setPrototypeOf(WrappedWorker, Object.getPrototypeOf(RealWorker));
-    Object.defineProperty(WrappedWorker, "prototype", {
-      value: RealWorker.prototype,
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    });
-    const workerConstructorDescriptor =
-      Object.getOwnPropertyDescriptor(RealWorker.prototype, "constructor");
-    Object.defineProperty(RealWorker.prototype, "constructor", {
-      value: WrappedWorker,
-      writable: workerConstructorDescriptor ? workerConstructorDescriptor.writable : true,
-      enumerable: workerConstructorDescriptor ? workerConstructorDescriptor.enumerable : false,
-      configurable: workerConstructorDescriptor ? workerConstructorDescriptor.configurable : true,
-    });
-    const descriptor = Object.getOwnPropertyDescriptor(realm, "Worker");
-    Object.defineProperty(realm, "Worker", {
-      value: WrappedWorker,
-      configurable: descriptor ? descriptor.configurable : true,
-      enumerable: descriptor ? descriptor.enumerable : false,
-      writable: descriptor ? descriptor.writable : true,
-    });
+          if (type === "module") {
+            // Static dependencies execute in source order. A separate first
+            // dependency installs the mask before the original module (and its
+            // dependencies). Dynamic import can miss SharedWorker connect events.
+            const prelude = Reflect.apply(nativeCreateObjectURL, NativeURL,
+              [new NativeBlob([payload], { type: "text/javascript" })]);
+            parts = ["import " + JSON.stringify(prelude) + ";\nimport " + JSON.stringify(absoluteUrl) + ";"];
+          } else {
+            parts = [payload, "\nimportScripts(" + JSON.stringify(absoluteUrl) + ");"];
+          }
+        } else return construct();
+
+        // Reuse the wrapper URL: SharedWorker identity is (URL, name). A fresh
+        // Blob URL per call would silently create separate workers or throw.
+        const blob = new NativeBlob(parts, { type: "text/javascript" });
+        const patched = Reflect.apply(nativeCreateObjectURL, NativeURL, [blob]);
+        if (shared) sharedWorkerUrls.set(cacheKey, patched);
+        args[0] = patched;
+        return construct();
+      };
+      registerOverride(WrappedWorker, property);
+      disguiseAsNative(WrappedWorker, property, NativeWorker.length);
+      Object.setPrototypeOf(WrappedWorker, Object.getPrototypeOf(NativeWorker));
+      Object.defineProperty(WrappedWorker, "prototype", { value: NativeWorker.prototype,
+        writable: false, enumerable: false, configurable: false });
+      const constructorDescriptor = Object.getOwnPropertyDescriptor(NativeWorker.prototype, "constructor");
+      Object.defineProperty(NativeWorker.prototype, "constructor", {
+        ...constructorDescriptor, value: WrappedWorker,
+      });
+      const descriptor = Object.getOwnPropertyDescriptor(realm, property);
+      Object.defineProperty(realm, property, { ...descriptor, value: WrappedWorker });
+    }
   }
 
   function element(tag, properties) {
@@ -3775,7 +3881,7 @@
     patchedRealms.add(Function.prototype);
     installFunctionMaskingOn(window);
   }
-  installIframeCoverage();
+  installIframeCoverage(window);
   registerMenus();
   installAutoVpnSync();
   installFloatingButton();

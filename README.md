@@ -17,8 +17,8 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 
 - `getCurrentPosition`、`watchPosition`、`clearWatch` 与定位权限状态。
 - 稳定的近似位置和坐标精度设置。
-- Date、Intl、IANA 时区及可选语言一致性。
-- 同源 iframe、Blob/Data/Module Worker，以及可选的实验性 URL Worker。
+- Date、Intl、Temporal.Now、IANA 时区及可选语言一致性。
+- 递归同源 iframe、Blob/Data/Module Worker 与 SharedWorker，以及可选的实验性 URL Worker。
 - 城市搜索、坐标到时区解析、地点配置档。
 - VPN 公网出口一键同步，以及页面运行期间的可选自动检查。
 - 所有网站、允许列表、排除列表三种应用范围。
@@ -28,6 +28,8 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 
 - Via 无法同步修改 HTTP `Accept-Language`，因此语言功能默认关闭并属于实验性功能。
 - 跨域 iframe 和 Service Worker 无法覆盖，URL Worker 为实验性功能。
+- Temporal、SharedWorker 仅在浏览器原生提供时包装，不会为不支持的 WebView 添加 API。同一注入实例管理的 SharedWorker 连接复用替换后的 URL；不同标签页或独立注入实例之间的共享身份无法保证。
+- iframe 的同步覆盖发生在 DOM 插入方法返回前；不保证覆盖 HTML 解析器或插入过程中已经执行的子页面脚本。MutationObserver 和 load 监听继续作为补充。
 - Via 没有扩展后台任务；VPN 自动同步只在至少一个网页标签运行时工作。
 - 页面运行中更新时区和语言后，Date 和新建 Intl 对象会使用当前设置；已有 Intl 实例及已启动的 Worker 保留创建时的设置，刷新页面可统一更新。
 - Via 原生设置已禁用 WebRTC，本项目不实现 WebRTC 包装。
@@ -46,6 +48,16 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 随后可能依次把该 IP 发送给一个或多个 IP 地理服务（FreeIPAPI、GeoJS、ReallyFreeGeoIP、ipinfo），成功后停止；结果缓存 30 天。
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
+
+## v1.0.5 修复
+
+- 补齐 `Temporal.Now.timeZoneId`、`plainDateTimeISO`、`plainDateISO`、`plainTimeISO`、`zonedDateTimeISO`；主页面、同源 iframe 和 Worker 共用实现，显式时区参数及关闭/排除状态保持原生语义。
+- 同时包装 `Worker` 和 `SharedWorker`，覆盖 Blob、Data 及模块脚本；保留 SharedWorker 字符串名称重载、同 URL 重复连接和构造器子类行为。实验性 URL 模块 Worker 先执行时区补丁模块，再执行原始模块及其依赖。
+- 同步拦截 `appendChild`、`insertBefore`、`replaceChild`、`append`、`prepend`、`replaceChildren`、`before`、`after`、`replaceWith`、`insertAdjacentElement`、`insertAdjacentHTML`、`innerHTML`、`outerHTML` 和 `document.write/writeln`，解决插入后立即从 `frames[n]` 读取的窗口；每层同源 iframe 都递归安装拦截。
+- 定位随机数改用启动时绑定的 `crypto.getRandomValues` 和预分配缓冲区，不再调用网页的 `Math.random`，也不消耗其伪随机序列。
+- 原生定位参数校验错误在向页面抛出前移除脚本调用帧，保留错误类型、消息和页面调用位置；支持没有 sourceURL 的 Via 注入。页面选项 getter 自己抛出的异常保持不变。补齐无参数 `clearWatch()` 的原生错误。
+
+本次在 Edge 157.0.4341.46 验证了新增 API 回归，以及既有 iframe/重复注入行为和 20 个时区相对 v1.0.4 的日期行为。可复现命令、覆盖范围及已知原生日期差异见 [测试说明](tests/README.md)。尚未在 Via/Android 真机验证。
 
 ## v1.0.4 修复
 
