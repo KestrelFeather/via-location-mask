@@ -12,9 +12,25 @@ node tests/hardening-regressions.cjs
 node tests/intrinsic-regressions.cjs
 node tests/locale-options-regressions.cjs
 node tests/locale-cache-regressions.cjs
+node tests/stack-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.11 验证结果
+
+实际浏览器：Edge 157.0.4341.46。`stack-regressions.cjs` 16/16；原有七套分别 8/8、4/4、3/3、24/24、15/15、32/32、34/34，共 136 组通过。语法检查及 `git diff --check` 通过。本轮 review 套件使用 `VLM_SKIP_BENCH=1`，保留 DOM 调用计数断言。
+
+- 窗口和同源 iframe 各验证具名/匿名注入。每个窗口场景包含 23 个异常用例，覆盖本次报告的 8 个问题以及 Date/Intl/Temporal/语言方法、Function.toString、DOM、Worker/SharedWorker、Navigator getter 和定位参数错误。比较错误类型、消息及完整堆栈字符串，不只搜索内部函数名。
+- Worker 与 SharedWorker 各比较 15 个可用 API 的异常。页面测试调用位于相同的具名 fixture，Worker 由异步消息触发，避免用归一化删掉真正的调用帧差异。
+- 窗口和 iframe 分别测试 30 层页面调用链及 `Error.stackTraceLimit=0/1/2/20`。保留原生第一帧和正确的总帧数，iframe 的设置不会被顶层覆盖。
+- 每个常规/深栈/Worker 场景还执行 40 个页面异常保持断言：预先创建的 Error、getter 内捕获的 JSON 原生异常、基本类型、Proxy 抛出值及自定义 stack getter。错误身份、已存在的堆栈和 getter/Proxy 调用情况保持不变；特意将页面抛错函数命名为 nativeApply，确保不会按名字误删。
+- 两组自定义 `Error.prepareStackTrace` 验证：窗口/iframe 中不提前调用、不替换该函数，由页面读取 stack 时自行格式化。此路径保留页面行为，不执行标准字符串堆栈清理。
+- `VLM_SOURCE` 指向 v1.0.10（`222abee`）时，同套 16 组有 13 组失败、3 组通过，能检出原有包装帧和缓存路径栈顶变化。
+
+复跑 `VLM_BENCH=1` 的默认格式化基准：20000 次、三个新页面的中位耗时，原生三个方法依次为 14.3/9.6/9.5 ms，v1.0.11 为 15.5/11.3/11.3 ms（toLocaleString/toLocaleDateString/toLocaleTimeString）。构造次数断言继续通过，缓存优化未回退到逐次构造格式化器。毫秒测量不作为通过阈值，也不代表手机性能。
+
+本次清理只处理在原生调用入口标记、且堆栈来源符合实际原生调用位置的同步异常。已被内部捕获的异常不读取 stack，页面主动抛出的异常不改写；自定义堆栈格式、全局错误事件 filename、异步 Promise 拒绝和已有日期算法差异不在逐帧一致性结论内。尚未做 Via/Android 真机验证。
 
 ## v1.0.10 验证结果
 
@@ -120,4 +136,4 @@ node tests/date-and-realms.cjs --native-dates
 - 未做 Via/Android 真机回归。没有 Temporal/SharedWorker 的环境只确认特性检测能正常跳过；不能据桌面结果推断每个 WebView 版本的支持情况。
 - iframe 插入方法返回后同步覆盖，不承诺覆盖解析器或插入内部先行执行的脚本，也不覆盖跨源 frame。
 - SharedWorker 的 URL 缓存由同一个注入实例管理；跨标签页/独立注入实例共享身份不保证。URL Worker 仍为实验性支持，受 CSP、相对模块路径和 worker location 等限制。
-- 错误堆栈修复针对定位原生参数校验异常的 `.stack`，依赖 Via 所用 V8 的 `Error.captureStackTrace`；不改写全局错误事件的 filename，也不宣称消除了所有 API 的检测特征。
+- 错误堆栈修复针对包装路径中已确认原生来源的同步异常 `.stack`，依赖 V8 的 `Error.captureStackTrace` 与标准字符串堆栈；不改写页面自定义 prepareStackTrace、异步 Promise 拒绝或全局错误事件的 filename，也不宣称消除了所有 API 的检测特征。

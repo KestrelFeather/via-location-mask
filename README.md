@@ -51,6 +51,15 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.11 修复
+
+- 将定位错误的堆栈保护扩展到方法、访问器和构造器包装边界，覆盖 Date、Intl、Temporal、DOM 插入、Worker/SharedWorker 等原生异常路径。使用保存的原生调用入口标记异常，在外层确认原生来源后保留原生帧，并重新捕获页面调用方帧，移除脚本内部和重复包装帧；支持匿名注入及各 realm 独立的 `Error.stackTraceLimit`。
+- 默认日期格式化缓存创建失败时退回 Date 原生路径，因此非法语言的栈顶保持 `Date.toLocaleString`，不会变成 `new DateTimeFormat`。
+- 仅在异常逃出公开包装函数时读取堆栈，内部探测/回退已捕获的异常不做堆栈格式化。页面 getter 主动抛出的值保持原样；页面自定义 `Error.prepareStackTrace` 不会被提前调用或替换。
+- 序列化到 Worker 的辅助函数显式保留严格模式，避免错误接收者 `null` 被转换成 Worker 全局对象。
+
+新增 16 组堆栈回归，逐帧对比原生与注入后的完整标准 V8 字符串堆栈；连同既有测试共 136 组通过。清理依赖 V8 `Error.captureStackTrace` 及标准堆栈格式，不清理自定义 `prepareStackTrace` 的结果，也不改写全局错误事件的 filename。详见 [测试说明](tests/README.md)。
+
 ## v1.0.10 优化
 
 - 为未传 options 的 Date `toLocaleString`、`toLocaleDateString`、`toLocaleTimeString` 缓存原生格式化器，按方法、语言和时区复用，避免每次注入时区都重新构造格式化器。窗口、同源 iframe 和 Worker/SharedWorker 使用同一实现。

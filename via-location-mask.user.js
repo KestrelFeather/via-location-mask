@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.10
+// @version      1.0.11
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -63,6 +63,7 @@
   // Private, startup-only snapshot. Never pass this object to page callbacks.
   // The same factory is serialized into workers before their scripts execute.
   function captureIntrinsics(root) {
+    "use strict"; // The serialized worker factory must retain strict receiver semantics.
     const apply = root.Reflect.apply;
     const ownNames = root.Object.getOwnPropertyNames;
     const descriptor = root.Object.getOwnPropertyDescriptor;
@@ -261,6 +262,123 @@
     I.dateParse = root.Date.parse;
     I.formatToParts = uncurried(root.Intl.DateTimeFormat.prototype.formatToParts);
     I.resolvedOptions = uncurried(root.Intl.DateTimeFormat.prototype.resolvedOptions);
+    const NativeError = root.Error, captureStack = NativeError.captureStackTrace;
+    I.installErrorRealm = NativeError;
+    let activeErrorRealm = NativeError;
+    const stackDescriptor = descriptor(new NativeError(), "stack");
+    const nativeErrors = I.newWeakMap();
+    const readStack = (error) => {
+      if (stackDescriptor && stackDescriptor.get) return apply(stackDescriptor.get, error, []);
+      // Older V8 uses a data property. Never invoke a page's stack getter.
+      const entry = descriptor(error, "stack");
+      return entry && "value" in entry ? entry.value : undefined;
+    };
+    const splitStack = (stack) => {
+      if (typeof stack !== "string") return null;
+      const start = I.methods.indexOf(stack, "\n    at ");
+      return start < 0 ? null : {
+        header: I.methods.slice(stack, 0, start),
+        frames: I.methods.split(I.methods.slice(stack, start + 1), "\n"),
+      };
+    };
+    let applyFrame, constructFrame, calibrating = true;
+    const nativeTrace = (error, kind, errorRealm) => {
+      try {
+        const prepare = descriptor(NativeError, "prepareStackTrace");
+        const realmPrepare = descriptor(errorRealm, "prepareStackTrace");
+        // Do not eagerly invoke a page's custom stack formatter. Its output is
+        // not the standard V8 string format this sanitizer operates on.
+        if (prepare && (!I.hasOwn(prepare, "value") || typeof prepare.value === "function")) return;
+        if (realmPrepare && (!I.hasOwn(realmPrepare, "value") || typeof realmPrepare.value === "function")) return;
+        const trace = splitStack(readStack(error));
+        if (!trace) return;
+        let index = 0;
+        while (index < trace.frames.length && I.methods.endsWith(trace.frames[index], " (<anonymous>)")) index++;
+        const frame = trace.frames[index];
+        if (calibrating) {
+          if (kind === "apply") applyFrame = frame;
+          else constructFrame = frame;
+          return;
+        }
+        // A native error starts with zero or more native frames immediately
+        // followed by OUR exact call site. A getter/callback's frame, even one
+        // named nativeApply, cannot match this location. Do not rewrite it.
+        if (!frame || frame !== (kind === "apply" ? applyFrame : constructFrame)) return;
+        return {
+          header: trace.header, prefix: I.methods.slice(trace.frames, 0, index), limit: trace.frames.length,
+        };
+      } catch (_) { /* Non-Error thrown values and custom stack formats pass through. */ }
+    };
+    const rememberError = (error, kind, errorRealm) => {
+      if (calibrating) { nativeTrace(error, kind, errorRealm); return; }
+      // Read/format a stack only when an exception escapes the public wrapper.
+      // Internal brand probes and fallback paths often catch native exceptions.
+      try { if (!I.WeakMaphas(nativeErrors, error)) I.WeakMapset(nativeErrors, error, kind); } catch (_) {}
+    };
+    I.nativeApply = function nativeApply(fn, receiver, args, errorRealm = activeErrorRealm) {
+      try { return apply(fn, receiver, args); }
+      catch (error) { rememberError(error, "apply", errorRealm); throw error; }
+    };
+    const construct = root.Reflect.construct;
+    I.nativeConstruct = function nativeConstruct(fn, args, target = fn) {
+      try { return construct(fn, args, target); }
+      catch (error) { rememberError(error, "construct", activeErrorRealm); throw error; }
+    };
+    // Calibrate against actual native exceptions, including anonymous Via eval
+    // locations. No filename or function-name blacklist is used for removal.
+    try { I.nativeApply(root.Date.prototype.getTime, {}, []); } catch (_) {}
+    try { I.nativeConstruct(root.Date, [root.Symbol()]); } catch (_) {}
+    calibrating = false;
+    I.cleanError = (error, wrapper, errorRealm = activeErrorRealm) => {
+      const kind = I.WeakMapget(nativeErrors, error);
+      if (!kind || !captureStack) return;
+      I.WeakMapdelete(nativeErrors, error);
+      const trace = nativeTrace(error, kind, errorRealm);
+      if (!trace) return;
+      try {
+        const holder = create(null);
+        const realmLimit = descriptor(errorRealm, "stackTraceLimit");
+        const frameLimit = realmLimit && typeof realmLimit.value === "number"
+          ? I.Math.max(0, I.Math.floor(realmLimit.value)) : trace.limit;
+        // The error can belong to an iframe with a different stackTraceLimit.
+        // Capture enough caller frames, restoring the root setting immediately.
+        const limit = descriptor(NativeError, "stackTraceLimit");
+        try {
+          I.Object.defineProperty(NativeError, "stackTraceLimit", { value: frameLimit, configurable: true, writable: true });
+          captureStack(holder, wrapper);
+        } finally {
+          if (limit) I.Object.defineProperty(NativeError, "stackTraceLimit", limit);
+          else delete NativeError.stackTraceLimit;
+        }
+        const callers = splitStack(readStack(holder));
+        const frames = I.methods.slice(callers ? I.methods.concat(trace.prefix, callers.frames) : trace.prefix, 0, frameLimit);
+        const stack = trace.header + (frames.length ? "\n" + I.methods.join(frames, "\n") : "");
+        if (stackDescriptor && stackDescriptor.set) apply(stackDescriptor.set, error, [stack]);
+        else I.Object.defineProperty(error, "stack", { value: stack, writable: true, configurable: true });
+      } catch (_) {}
+    };
+    I.guardMethod = (fn) => {
+      const errorRealm = I.installErrorRealm;
+      const wrapper = { method(...args) {
+        const previous = activeErrorRealm;
+        activeErrorRealm = errorRealm;
+        try { return apply(fn, this, args); }
+        catch (error) { I.cleanError(error, wrapper); throw error; }
+        finally { activeErrorRealm = previous; }
+      } }.method;
+      return wrapper;
+    };
+    I.guardConstructor = (fn) => {
+      const errorRealm = I.installErrorRealm;
+      const wrapper = function (...args) {
+        const previous = activeErrorRealm;
+        activeErrorRealm = errorRealm;
+        try { return new.target ? construct(fn, args, new.target) : apply(fn, this, args); }
+        catch (error) { I.cleanError(error, wrapper); throw error; }
+        finally { activeErrorRealm = previous; }
+      };
+      return wrapper;
+    };
     I.createDefaultDateFormatter = (NativeDateTimeFormat) => {
       const formatGetter = descriptor(NativeDateTimeFormat.prototype, "format").get;
       let entries = [], lastTimezone, lastSettings;
@@ -287,7 +405,9 @@
         if (property !== "toLocaleDateString") {
           options.hour = options.minute = options.second = "numeric";
         }
-        const formatter = new NativeDateTimeFormat(locales, options);
+        let formatter;
+        try { formatter = new NativeDateTimeFormat(locales, options); }
+        catch (_) { return undefined; } // Native Date owns locale validation and its stack frame.
         const format = apply(formatGetter, formatter, []);
         // Bound memory even when a page cycles through many locale strings.
         if (entries.length === 32) entries = [];
@@ -300,7 +420,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.10";
+  const VERSION = "1.0.11";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -318,7 +438,7 @@
   // Captured before page code runs; a page can shadow window.length but not
   // this native getter, and indexed child access on a WindowProxy is unhookable.
   const nativeWindowLength = I.Object.getOwnPropertyDescriptor(window, "length").get;
-  const nativeFunctionSource = I.Reflect.apply(initialToString, Function, []);
+  const nativeFunctionSource = I.nativeApply(initialToString, Function, []);
   const DEFAULT_SETTINGS = I.Object.freeze({
     enabled: false,
     latitude: 25.033,
@@ -354,8 +474,6 @@
     randomFill(randomBuffer);
     return ((randomBuffer[0] >>> 5) * 67108864 + (randomBuffer[1] >>> 6)) / 9007199254740992;
   }
-  const nativeGeoErrors = I.newWeakSet();
-  const captureStackTrace = Error.captureStackTrace;
   const coveredIframeRealms = I.newWeakSet();
   const iframeObserverApis = I.newWeakMap();
   const observedIframeDocuments = I.newWeakSet();
@@ -377,7 +495,7 @@
   // recognize masks without ever calling page code. When an ancestor's mask
   // is already installed here it still reports this unregistered function's
   // real source.
-  const maskSource = I.Reflect.apply(
+  const maskSource = I.nativeApply(
     initialToString,
     createMaskedToString(initialToString, "", ""),
     []
@@ -423,28 +541,31 @@
   // realm, after that mask is recognized by its native source text.
   function createMaskedToString(nativeToString, nativePrefix, nativeSuffix) {
     let delegating = false;
+    const errorRealm = I.installErrorRealm;
     const maskedToString = {
       toString() {
-        const name = I.WeakMapget(overrideRegistry, this);
-        if (name !== undefined) return nativePrefix + name + nativeSuffix;
-        const source = I.Reflect.apply(nativeToString, this, []);
-        // Native functions, bound functions and proxies need no lookup, and
-        // skipping them keeps proxy traps from observing the calls below.
-        if (delegating || !maskSource || I.methods.test(/\[native code\]\s*\}$/, source)) return source;
-        const prototype = I.Reflect.getPrototypeOf(this);
-        // Frames (siblings included) may have appeared since the last walk.
-        if (!I.WeakSethas(knownRealms, prototype)) discoverRealms();
-        if (!I.WeakSethas(knownRealms, prototype)) return source;
-        const descriptor = I.Reflect.getOwnPropertyDescriptor(prototype, "toString");
-        const owner = descriptor && descriptor.value;
-        if (typeof owner !== "function" || owner === maskedToString ||
-            I.Reflect.apply(nativeToString, owner, []) !== maskSource) return source;
-        delegating = true;
         try {
-          return I.Reflect.apply(owner, this, []);
-        } finally {
-          delegating = false;
-        }
+          const name = I.WeakMapget(overrideRegistry, this);
+          if (name !== undefined) return nativePrefix + name + nativeSuffix;
+          const source = I.nativeApply(nativeToString, this, [], errorRealm);
+          // Native functions, bound functions and proxies need no lookup, and
+          // skipping them keeps proxy traps from observing the calls below.
+          if (delegating || !maskSource || I.methods.test(/\[native code\]\s*\}$/, source)) return source;
+          const prototype = I.Reflect.getPrototypeOf(this);
+          // Frames (siblings included) may have appeared since the last walk.
+          if (!I.WeakSethas(knownRealms, prototype)) discoverRealms();
+          if (!I.WeakSethas(knownRealms, prototype)) return source;
+          const descriptor = I.Reflect.getOwnPropertyDescriptor(prototype, "toString");
+          const owner = descriptor && descriptor.value;
+          if (typeof owner !== "function" || owner === maskedToString ||
+              I.nativeApply(nativeToString, owner, []) !== maskSource) return source;
+          delegating = true;
+          try {
+            return I.nativeApply(owner, this, []);
+          } finally {
+            delegating = false;
+          }
+        } catch (error) { I.cleanError(error, maskedToString, errorRealm); throw error; }
       },
     }.toString;
     return maskedToString;
@@ -458,7 +579,7 @@
       const descriptor = I.Reflect.getOwnPropertyDescriptor(realm, "Function");
       const constructor = descriptor && descriptor.value;
       if (typeof constructor !== "function" ||
-          I.Reflect.apply(initialToString, constructor, []) !== nativeFunctionSource) return null;
+          I.nativeApply(initialToString, constructor, []) !== nativeFunctionSource) return null;
       const prototypeDescriptor = I.Reflect.getOwnPropertyDescriptor(constructor, "prototype");
       return prototypeDescriptor ? prototypeDescriptor.value : null;
     } catch (_) {
@@ -475,7 +596,7 @@
       if (depth > 32) return;
       let count = 0;
       try {
-        count = I.Reflect.apply(nativeWindowLength, frame, []);
+        count = I.nativeApply(nativeWindowLength, frame, []);
       } catch (_) {
         return;
       }
@@ -501,11 +622,11 @@
     const current = descriptor && descriptor.value;
     if (typeof current !== "function") return false;
     if (I.WeakMaphas(overrideRegistry, current)) return true;
-    return !!maskSource && I.Reflect.apply(initialToString, current, []) === maskSource;
+    return !!maskSource && I.nativeApply(initialToString, current, []) === maskSource;
   }
 
   function log(...args) {
-    if (settings.debug) I.Reflect.apply(console.debug, console, I.methods.concat(["[Via Location Mask]"], args));
+    if (settings.debug) I.nativeApply(console.debug, console, I.methods.concat(["[Via Location Mask]"], args));
   }
 
   function finiteNumber(value, fallback) {
@@ -1153,13 +1274,13 @@
   }
 
   function callOriginalToString(fn) {
-    return I.Reflect.apply(originals.functionToString, fn, []);
+    return I.nativeApply(originals.functionToString, fn, []);
   }
 
   function isConstructible(fn) {
     if (typeof fn !== "function") return false;
     try {
-      I.Reflect.construct(new I.Proxy(fn, { construct: () => ({}) }), []);
+      I.nativeConstruct(new I.Proxy(fn, { construct: () => ({}) }), []);
       return true;
     } catch (_) {
       return false;
@@ -1167,24 +1288,7 @@
   }
 
   function stripConstruct(fn) {
-    const wrapper = {
-      method(...args) {
-
-        try {
-          return I.Reflect.apply(fn, this, args);
-        } catch (error) {
-          // Only errors produced by native argument validation are rewritten.
-          // Page-thrown values (including option getters) retain their identity
-          // and original stack. V8's boundary also works for anonymous Via evals.
-          if (I.WeakSethas(nativeGeoErrors, error) && captureStackTrace) {
-            I.WeakSetdelete(nativeGeoErrors, error);
-            try { captureStackTrace(error, wrapper); } catch (_) {}
-          }
-          throw error;
-        }
-      },
-    }.method;
-    return wrapper;
+    return I.guardMethod(fn);
   }
 
   function disguiseAsNative(fn, nativeName, expectedLength) {
@@ -1215,10 +1319,7 @@
           ? 0
           : forcedLength;
     let finalFunction = implementation;
-    if (
-      I.hasOwn(implementation, "prototype") &&
-      !isConstructible(original)
-    ) {
+    if (!isConstructible(original)) {
       finalFunction = stripConstruct(implementation);
     }
     registerOverride(finalFunction, property);
@@ -1273,7 +1374,7 @@
   function installFunctionMaskingOn(realm) {
     const functionPrototype = realm.Function.prototype;
     const nativeToString = functionPrototype.toString;
-    const numberSource = I.Reflect.apply(nativeToString, realm.Number, []);
+    const numberSource = I.nativeApply(nativeToString, realm.Number, []);
     const split = I.methods.split(numberSource, "Number");
     const nativePrefix = split[0] || "function ";
     const nativeSuffix = split[1] || "() { [native code] }";
@@ -1519,7 +1620,7 @@
           get: function geolocationCoordinateGetter() {
             const slots = I.WeakMapget(coordsSlots, this);
             if (slots) return slots[key];
-            return I.Reflect.apply(nativeGetter, this, []);
+            return I.nativeApply(nativeGetter, this, []);
           },
         });
       }
@@ -1540,7 +1641,7 @@
               speed: slots.speed,
             };
           }
-          if (typeof nativeToJSON === "function") return I.Reflect.apply(nativeToJSON, this, []);
+          if (typeof nativeToJSON === "function") return I.nativeApply(nativeToJSON, this, []);
           return {};
         },
         0
@@ -1557,7 +1658,7 @@
           get: function geolocationPositionGetter() {
             const slots = I.WeakMapget(positionSlots, this);
             if (slots) return slots[key];
-            return I.Reflect.apply(nativeGetter, this, []);
+            return I.nativeApply(nativeGetter, this, []);
           },
         });
       }
@@ -1584,7 +1685,7 @@
                 : slots.coords,
             };
           }
-          if (typeof nativeToJSON === "function") return I.Reflect.apply(nativeToJSON, this, []);
+          if (typeof nativeToJSON === "function") return I.nativeApply(nativeToJSON, this, []);
           return {};
         },
         0
@@ -1631,12 +1732,7 @@
     const forwarded = I.list(args);
     if (typeof forwarded[0] === "function") forwarded[0] = function noop() {};
     if (typeof forwarded[1] === "function") forwarded[1] = function noop() {};
-    try {
-      return I.Reflect.apply(nativeMethod, receiver, forwarded);
-    } catch (error) {
-      if (error && typeof error === "object") I.WeakSetadd(nativeGeoErrors, error);
-      throw error;
-    }
+    return I.nativeApply(nativeMethod, receiver, forwarded);
   }
 
   function deliver(callback, value, delay) {
@@ -1676,7 +1772,7 @@
         return reproduceNativeError(native.getCurrentPosition, this, arguments);
       }
       if (!protectionActive()) {
-        return I.Reflect.apply(native.getCurrentPosition, this, [success, error, options]);
+        return I.nativeApply(native.getCurrentPosition, this, [success, error, options]);
       }
       const cachedPosition = getCached(options);
       if (cachedPosition) {
@@ -1684,7 +1780,7 @@
         return undefined;
       }
       if (settings.preservePermissionPrompt) {
-        return I.Reflect.apply(native.getCurrentPosition, this, [
+        return I.nativeApply(native.getCurrentPosition, this, [
           function nativePromptGranted() {
             deliver(success, freshPosition());
           },
@@ -1702,10 +1798,10 @@
         return 0;
       }
       if (!protectionActive()) {
-        return I.Reflect.apply(native.watchPosition, this, [success, error, options]);
+        return I.nativeApply(native.watchPosition, this, [success, error, options]);
       }
       if (settings.preservePermissionPrompt) {
-        return I.Reflect.apply(native.watchPosition, this, [
+        return I.nativeApply(native.watchPosition, this, [
           function nativeWatchGranted() {
             if (protectionActive()) deliver(success, freshPosition());
           },
@@ -1759,7 +1855,7 @@
         I.Setdelete(syntheticWatchStops, record.stop);
         return undefined;
       }
-      return I.Reflect.apply(native.clearWatch, this, [watchId]);
+      return I.nativeApply(native.clearWatch, this, [watchId]);
     }
 
     return { getCurrentPosition, watchPosition, clearWatch };
@@ -1786,7 +1882,7 @@
     if (realm.PermissionStatus) I.Object.setPrototypeOf(target, realm.PermissionStatus.prototype);
     const slots = { state: "granted", name: "geolocation", onchange: null, listener: null };
     slots.listener = function (event) {
-      if (typeof slots.onchange === "function") I.Reflect.apply(slots.onchange, target, [event]);
+      if (typeof slots.onchange === "function") I.nativeApply(slots.onchange, target, [event]);
     };
     I.WeakMapset(permissionSlots, target, slots);
     const prototype = realm.PermissionStatus && realm.PermissionStatus.prototype;
@@ -1826,13 +1922,13 @@
       const accessors = {
         get: function permissionStatusGetter() {
           const slots = I.WeakMapget(permissionSlots, this);
-          return slots ? slots[key] : I.Reflect.apply(nativeGet, this, []);
+          return slots ? slots[key] : I.nativeApply(nativeGet, this, []);
         },
       };
       if (key === "onchange" && typeof nativeSet === "function") {
         accessors.set = function permissionStatusSetter(value) {
           const slots = I.WeakMapget(permissionSlots, this);
-          if (!slots) return I.Reflect.apply(nativeSet, this, [value]);
+          if (!slots) return I.nativeApply(nativeSet, this, [value]);
           setPermissionOnchange(this, slots, value);
           return undefined;
         };
@@ -1846,7 +1942,7 @@
     installPermissionStatusAccessors(realm);
     function permissionsQuery(descriptor) {
       if (!(this instanceof realm.Permissions)) {
-        return I.Reflect.apply(native.permissionsQuery, this, [descriptor]);
+        return I.nativeApply(native.permissionsQuery, this, [descriptor]);
       }
       if (
         protectionActive() &&
@@ -1856,7 +1952,7 @@
       ) {
         return I.promiseResolve(createPermissionStatus(realm));
       }
-      return I.Reflect.apply(native.permissionsQuery, this, [descriptor]);
+      return I.nativeApply(native.permissionsQuery, this, [descriptor]);
     }
     installOverride(realm.Permissions.prototype, "query", permissionsQuery, 1);
   }
@@ -1889,10 +1985,11 @@
     let Wrapped = function (...args) {
 
       const finalArgs = buildArguments(args);
-      if (!new.target) return I.Reflect.apply(Native, this, finalArgs);
+      if (!new.target) return I.nativeApply(Native, this, finalArgs);
       const target = new.target && new.target !== Wrapped ? new.target : Native;
-      return I.Reflect.construct(Native, finalArgs, target);
+      return I.nativeConstruct(Native, finalArgs, target);
     };
+    Wrapped = I.guardConstructor(Wrapped);
     registerOverride(Wrapped, property);
     disguiseAsNative(Wrapped, property, Native.length);
     try {
@@ -1931,7 +2028,7 @@
       const nativeGetLanguage = languageDescriptor.get;
       installAccessor(NavigatorPrototype, "language", {
         get: function navigatorLanguageGetter() {
-          const nativeValue = I.Reflect.apply(nativeGetLanguage, this, []);
+          const nativeValue = I.nativeApply(nativeGetLanguage, this, []);
           return protectionActive() && settings.localeEnabled ? settings.language : nativeValue;
         },
       });
@@ -1943,7 +2040,7 @@
       let spoofedLanguages;
       installAccessor(NavigatorPrototype, "languages", {
         get: function navigatorLanguagesGetter() {
-          const nativeValue = I.Reflect.apply(nativeGetLanguages, this, []);
+          const nativeValue = I.nativeApply(nativeGetLanguages, this, []);
           if (!protectionActive() || !settings.localeEnabled) return nativeValue;
           // Settings reloads replace the array; keep the frozen copy (and its
           // identity) unless the languages actually changed.
@@ -1981,7 +2078,7 @@
           }
           args[optionsIndex] = I.withTimezone(args[optionsIndex], settings.timezone);
         }
-        return I.Reflect.apply(nativeMethod, this, args);
+        return I.nativeApply(nativeMethod, this, args);
       },
       nativeMethod.length
     );
@@ -2047,6 +2144,7 @@
   // Self-contained: its source is also injected into Worker bootstraps, so it
   // must not reference anything outside its own parameters.
   function createZoneTools(NativeDate, NativeDateTimeFormat, getTimezone, I) {
+    "use strict";
     const nativeGetTime = NativeDate.prototype.getTime;
     const nativeGetUTCMilliseconds = NativeDate.prototype.getUTCMilliseconds;
     const nativeLocal = {
@@ -2094,7 +2192,7 @@
     }
 
     function epoch(value) {
-      return I.Reflect.apply(nativeGetTime, value, []);
+      return I.nativeApply(nativeGetTime, value, []);
     }
 
     function parts(value) {
@@ -2113,7 +2211,7 @@
         hour: I.NumberCtor(result.hour) % 24,
         minute: I.NumberCtor(result.minute),
         second: I.NumberCtor(result.second),
-        millisecond: I.Reflect.apply(nativeGetUTCMilliseconds, value, []),
+        millisecond: I.nativeApply(nativeGetUTCMilliseconds, value, []),
         weekday: I.methods.indexOf(weekdayNames, result.weekday),
       };
     }
@@ -2250,7 +2348,7 @@
       const probe = timestamp < 0 || timestamp > MAX_EPOCH_MS
         ? equivalentTime(timestamp)
         : timestamp;
-      const daylight = offsetAt(probe) < I.Reflect.apply(I.Math.max, undefined, yearOffsets(probe));
+      const daylight = offsetAt(probe) < I.nativeApply(I.Math.max, undefined, yearOffsets(probe));
       if (!daylight) return currentNames.standard;
       return currentNames.daylight || nameAt(timestamp);
     }
@@ -2288,7 +2386,7 @@
     }
 
     function localFields(date) {
-      const read = (name) => I.Reflect.apply(nativeLocal[name], date, []);
+      const read = (name) => I.nativeApply(nativeLocal[name], date, []);
       return {
         year: read("getFullYear"),
         month: read("getMonth") + 1,
@@ -2349,7 +2447,7 @@
     }
 
     function applyNative(method, receiver, args) {
-      return I.Reflect.apply(native[method], receiver, I.list(args));
+      return I.nativeApply(native[method], receiver, I.list(args));
     }
 
     function currentParts(receiver, fullYearSpecial) {
@@ -2362,7 +2460,7 @@
 
     function commit(receiver, values) {
       const timestamp = tools.wallToEpoch(values);
-      I.Reflect.apply(native.setTime, receiver, [timestamp]);
+      I.nativeApply(native.setTime, receiver, [timestamp]);
       return timestamp;
     }
 
@@ -2519,7 +2617,7 @@
       const nativeMethod = Constructor.prototype[property];
       if (typeof nativeMethod !== "function") continue;
       installOverride(Constructor.prototype, property, function xsltTransform() {
-        const result = I.Reflect.apply(nativeMethod, this, I.list(arguments));
+        const result = I.nativeApply(nativeMethod, this, I.list(arguments));
         try {
           rewriteTree(result);
         } catch (_) {
@@ -2538,7 +2636,7 @@
     const nativeGet = descriptor.get;
     installAccessor(DocumentPrototype, "lastModified", {
       get: function documentLastModifiedGetter() {
-        const nativeValue = I.Reflect.apply(nativeGet, this, []);
+        const nativeValue = I.nativeApply(nativeGet, this, []);
         if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
         const parsed = new NativeDate(nativeValue);
         const item = tools.parts(parsed);
@@ -2590,7 +2688,7 @@
         prototype,
         property,
         function timezoneDateGetter() {
-          const nativeValue = I.Reflect.apply(nativeGetters[property], this, []);
+          const nativeValue = I.nativeApply(nativeGetters[property], this, []);
           if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
           const item = tools.parts(this);
           if (!item) return NaN;
@@ -2606,7 +2704,7 @@
       prototype,
       "getTimezoneOffset",
       function getTimezoneOffset() {
-        const nativeValue = I.Reflect.apply(nativeGetters.getTimezoneOffset, this, []);
+        const nativeValue = I.nativeApply(nativeGetters.getTimezoneOffset, this, []);
         if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
         return tools.timezoneOffset(tools.epoch(this));
       },
@@ -2616,7 +2714,7 @@
       prototype,
       "toDateString",
       function toDateString() {
-        const nativeValue = I.Reflect.apply(nativeGetters.toDateString, this, []);
+        const nativeValue = I.nativeApply(nativeGetters.toDateString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.dateText(this) : nativeValue;
       },
       0
@@ -2625,7 +2723,7 @@
       prototype,
       "toTimeString",
       function toTimeString() {
-        const nativeValue = I.Reflect.apply(nativeGetters.toTimeString, this, []);
+        const nativeValue = I.nativeApply(nativeGetters.toTimeString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.timeText(this) : nativeValue;
       },
       0
@@ -2634,7 +2732,7 @@
       prototype,
       "toString",
       function toString() {
-        const nativeValue = I.Reflect.apply(nativeGetters.toString, this, []);
+        const nativeValue = I.nativeApply(nativeGetters.toString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.fullText(this) : nativeValue;
       },
       0
@@ -2654,18 +2752,18 @@
       }
       if (!protectionActive() || !settings.timezoneEnabled) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
-        return I.Reflect.construct(NativeDate, args, target);
+        return I.nativeConstruct(NativeDate, args, target);
       }
       if (args.length === 1) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
         if (typeof args[0] === "string" && tools.isAmbiguous(args[0])) {
-          return I.Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target);
+          return I.nativeConstruct(NativeDate, [tools.parseLocal(args[0])], target);
         }
-        return I.Reflect.construct(NativeDate, args, target);
+        return I.nativeConstruct(NativeDate, args, target);
       }
       if (args.length < 2) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
-        return I.Reflect.construct(NativeDate, args, target);
+        return I.nativeConstruct(NativeDate, args, target);
       }
       const timestamp = tools.wallToEpoch({
         year: tools.makeYear(args[0]),
@@ -2677,22 +2775,24 @@
         millisecond: args.length > 6 ? I.NumberCtor(args[6]) : 0,
       });
       const target = new.target === WrappedDate ? NativeDate : new.target;
-      return I.Reflect.construct(NativeDate, [timestamp], target);
+      return I.nativeConstruct(NativeDate, [timestamp], target);
     };
+    WrappedDate = I.guardConstructor(WrappedDate);
     registerOverride(WrappedDate, "Date");
     disguiseAsNative(WrappedDate, "Date", NativeDate.length);
     I.Object.setPrototypeOf(WrappedDate, I.Object.getPrototypeOf(NativeDate));
     copyConstructorStatics(NativeDate, WrappedDate);
-    const wrappedParse = function parse(value) {
+    let wrappedParse = function parse(value) {
       if (!protectionActive() || !settings.timezoneEnabled) {
-        return I.Reflect.apply(nativeDateParse, NativeDate, arguments);
+        return I.nativeApply(nativeDateParse, NativeDate, arguments);
       }
       const stringValue = typeof value === "string" ? value : "" + value;
       if (!tools.isAmbiguous(stringValue)) {
-        return I.Reflect.apply(nativeDateParse, NativeDate, [stringValue]);
+        return I.nativeApply(nativeDateParse, NativeDate, [stringValue]);
       }
       return tools.parseLocal(stringValue);
     };
+    wrappedParse = I.guardMethod(wrappedParse);
     registerOverride(wrappedParse, "parse");
     disguiseAsNative(wrappedParse, "parse", nativeDateParse.length);
     I.Object.defineProperty(WrappedDate, "parse", {
@@ -2726,6 +2826,7 @@
   // Shared by windows and worker payloads. Explicit zones, including invalid
   // arguments, are delegated unchanged; only an omitted/undefined zone defaults.
   function patchTemporalOverrides(realm, getTimezone, install, getLocales, I) {
+    "use strict";
     const now = realm.Temporal && realm.Temporal.Now;
     if (!now) return;
     for (let _index20 = 0, _items20 = I.list([
@@ -2740,7 +2841,7 @@
           if (property === "timeZoneId" && timezone) return timezone;
 
           if (property !== "timeZoneId" && args[0] === undefined && timezone) args[0] = timezone;
-          return I.Reflect.apply(nativeMethod, this, args);
+          return I.nativeApply(nativeMethod, this, args);
         },
       }[property];
       install(now, property, method);
@@ -2757,7 +2858,7 @@
         }
         const timezone = getTimezone();
         if (timezone) args[1] = I.withTimezone(args[1], timezone);
-        return I.Reflect.apply(nativeLocaleString, this, args);
+        return I.nativeApply(nativeLocaleString, this, args);
       },
     }.toLocaleString);
   }
@@ -2784,6 +2885,8 @@
     I.WeakSetadd(knownRealms, realmKey);
     // Another instance (inside that frame, or a re-injection) already owns it.
     if (realmMasked(realmKey)) return false;
+    const previousErrorRealm = I.installErrorRealm;
+    I.installErrorRealm = realm.Error;
     try {
       installFunctionMaskingOn(realm);
       installEnvironmentOverrides(realm);
@@ -2827,6 +2930,8 @@
     } catch (error) {
       log("Could not patch realm", error);
       return false;
+    } finally {
+      I.installErrorRealm = previousErrorRealm;
     }
   }
 
@@ -2892,7 +2997,7 @@
           if (!descriptor || typeof descriptor.get !== "function") continue;
           installAccessor(target, property, {
             get: function iframeRealmGetter() {
-              const value = I.Reflect.apply(descriptor.get, this, []);
+              const value = I.nativeApply(descriptor.get, this, []);
               try {
                 patchWindow(property === "contentWindow" ? value : value && value.defaultView);
               } catch (_) {}
@@ -2916,11 +3021,11 @@
       const collect = (node, frames) => {
         if (!node || (typeof node !== "object" && typeof node !== "function")) return;
         let type;
-        try { type = I.Reflect.apply(nodeType, node, []); } catch (_) { return; }
+        try { type = I.nativeApply(nodeType, node, []); } catch (_) { return; }
         if (!queries[type]) return;
         if (type === 1 && node.localName === "iframe") I.Setadd(frames, node);
-        if (!I.Reflect.apply(firstChild, node, [])) return;
-        for (let _index23 = 0, _items23 = I.list(I.Reflect.apply(queries[type], node, ["iframe"])); _index23 < _items23.length; _index23++) {
+        if (!I.nativeApply(firstChild, node, [])) return;
+        for (let _index23 = 0, _items23 = I.list(I.nativeApply(queries[type], node, ["iframe"])); _index23 < _items23.length; _index23++) {
           const frame = _items23[_index23];
           I.Setadd(frames, frame);
         }
@@ -2939,7 +3044,7 @@
           if (argumentIndex === undefined) {
             for (let index = 0; index < arguments.length; index++) collect(arguments[index], frames);
           } else collect(arguments[argumentIndex], frames);
-          const result = I.Reflect.apply(descriptor.value, this, arguments);
+          const result = I.nativeApply(descriptor.value, this, arguments);
           patch(frames);
           return result;
         });
@@ -2948,25 +3053,25 @@
       // nodes. A short-lived observer records just this operation's additions;
       // takeRecords is synchronous and never scans the destination's old DOM.
       const observeInsertion = (receiver, nativeMethod, args, useParent) => {
-        const observer = I.Reflect.construct(observerApi.Constructor, [() => {}]);
+        const observer = I.nativeConstruct(observerApi.Constructor, [() => {}]);
         try {
           let target = receiver;
-          if (useParent) target = I.Reflect.apply(parentNode, receiver, []) || receiver;
-          I.Reflect.apply(observerApi.observe, observer, [target, { childList: true, subtree: true }]);
+          if (useParent) target = I.nativeApply(parentNode, receiver, []) || receiver;
+          I.nativeApply(observerApi.observe, observer, [target, { childList: true, subtree: true }]);
         } catch (_) { /* The native operation below owns receiver validation. */ }
         try {
-          const result = I.Reflect.apply(nativeMethod, receiver, args);
+          const result = I.nativeApply(nativeMethod, receiver, args);
           const frames = I.newSet();
-          for (let _index25 = 0, _items25 = I.list(I.Reflect.apply(observerApi.takeRecords, observer, [])); _index25 < _items25.length; _index25++) {
+          for (let _index25 = 0, _items25 = I.list(I.nativeApply(observerApi.takeRecords, observer, [])); _index25 < _items25.length; _index25++) {
             const record = _items25[_index25];
-            for (let _index26 = 0, _items26 = I.list(I.Reflect.apply(observerApi.addedNodes, record, [])); _index26 < _items26.length; _index26++) {
+            for (let _index26 = 0, _items26 = I.list(I.nativeApply(observerApi.addedNodes, record, [])); _index26 < _items26.length; _index26++) {
               const node = _items26[_index26];
               collect(node, frames);
             }
           }
           patch(frames);
           return result;
-        } finally { I.Reflect.apply(observerApi.disconnect, observer, []); }
+        } finally { I.nativeApply(observerApi.disconnect, observer, []); }
       };
       const wrapHTML = (prototype, property, useParent) => {
         const descriptor = prototype && I.Object.getOwnPropertyDescriptor(prototype, property);
@@ -3012,16 +3117,16 @@
     // Observe the Document itself, including document-start before <html> exists.
     if (doc && !I.WeakSethas(observedIframeDocuments, doc)) {
       I.WeakSetadd(observedIframeDocuments, doc);
-      const observer = I.Reflect.construct(observerApi.Constructor, [(mutations) => {
+      const observer = I.nativeConstruct(observerApi.Constructor, [(mutations) => {
         for (let _index33 = 0, _items33 = I.list(mutations); _index33 < _items33.length; _index33++) {
           const mutation = _items33[_index33];
-          for (let _index34 = 0, _items34 = I.list(I.Reflect.apply(observerApi.addedNodes, mutation, [])); _index34 < _items34.length; _index34++) {
+          for (let _index34 = 0, _items34 = I.list(I.nativeApply(observerApi.addedNodes, mutation, [])); _index34 < _items34.length; _index34++) {
             const node = _items34[_index34];
             scanNodeForIframes(node);
           }
         }
       }]);
-      I.Reflect.apply(observerApi.observe, observer, [doc, { childList: true, subtree: true }]);
+      I.nativeApply(observerApi.observe, observer, [doc, { childList: true, subtree: true }]);
       scanNodeForIframes(doc);
     }
   }
@@ -3033,6 +3138,7 @@
     const nativeToString = Function.prototype.toString;
     const nativeNames = I.newWeakMap();
     const mark = (fn, name, length) => {
+      if (!I.hasOwn(fn, "prototype")) fn = I.guardMethod(fn);
       I.WeakMapset(nativeNames, fn, name);
       try {
         I.Object.defineProperty(fn, "name", { value: name, configurable: true });
@@ -3046,7 +3152,7 @@
       toString() {
         const name = I.WeakMapget(nativeNames, this);
         return name ? "function " + name + "() { [native code] }" :
-          I.Reflect.apply(nativeToString, this, []);
+          I.nativeApply(nativeToString, this, []);
       },
     }.toString, "toString");
 
@@ -3072,7 +3178,7 @@
         const nativeGet = descriptor.get;
         const getter = mark(I.lookupGetter({
           get value() {
-            const nativeValue = I.Reflect.apply(nativeGet, this, []);
+            const nativeValue = I.nativeApply(nativeGet, this, []);
             return property === "language" ? config.language : languageList;
           },
         }, "value"), "get " + property);
@@ -3094,9 +3200,10 @@
           args[1] = I.withTimezone(args[1], config.timezone);
         }
         const target = new.target && new.target !== Wrapped ? new.target : Native;
-        if (!new.target) return I.Reflect.apply(Native, this, args);
-        return I.Reflect.construct(Native, args, target);
+        if (!new.target) return I.nativeApply(Native, this, args);
+        return I.nativeConstruct(Native, args, target);
       };
+      Wrapped = I.guardConstructor(Wrapped);
       mark(Wrapped, name, Native.length);
       I.Object.setPrototypeOf(Wrapped, I.Object.getPrototypeOf(Native));
       for (let _index36 = 0, _items36 = I.list(I.Reflect.ownKeys(Native)); _index36 < _items36.length; _index36++) {
@@ -3156,7 +3263,7 @@
         const nativeMethod = nativeDateMethods[property];
         const override = mark({
           [property]() {
-            const nativeValue = I.Reflect.apply(nativeMethod, this, []);
+            const nativeValue = I.nativeApply(nativeMethod, this, []);
             const value = tools.parts(this);
             if (!value) return nativeValue;
             const result = value[getters[property]];
@@ -3170,7 +3277,7 @@
       const nativeOffset = nativeDateMethods.getTimezoneOffset;
       NativeDate.prototype.getTimezoneOffset = mark({
         getTimezoneOffset() {
-          I.Reflect.apply(nativeOffset, this, []);
+          I.nativeApply(nativeOffset, this, []);
           return tools.timezoneOffset(tools.epoch(this));
         },
       }.getTimezoneOffset, "getTimezoneOffset");
@@ -3185,7 +3292,7 @@
         const nativeMethod = nativeDateMethods[property];
         NativeDate.prototype[property] = mark({
           [property]() {
-            I.Reflect.apply(nativeMethod, this, []);
+            I.nativeApply(nativeMethod, this, []);
             return textMethods[property](this);
           },
         }[property], property, 0);
@@ -3200,7 +3307,7 @@
             : (property === "setFullYear" || property === "setYear"
               ? { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 }
               : null);
-          if (!item) return I.Reflect.apply(nativeMethod, receiver, args);
+          if (!item) return I.nativeApply(nativeMethod, receiver, args);
           const values = {
             year: item.year, month: item.month, day: item.day, hour: item.hour,
             minute: item.minute, second: item.second,
@@ -3231,10 +3338,10 @@
             values.year = tools.makeYear(args[0]);
           }
           const result = tools.wallToEpoch(values);
-          I.Reflect.apply(nativeDateMethods.setTime, receiver, [result]);
+          I.nativeApply(nativeDateMethods.setTime, receiver, [result]);
           return result;
         } catch (_) {
-          return I.Reflect.apply(nativeMethod, receiver, args);
+          return I.nativeApply(nativeMethod, receiver, args);
         }
       };
       for (let _index41 = 0, _items41 = I.list([
@@ -3256,8 +3363,8 @@
         const target = new.target === WrappedDate ? NativeDate : new.target;
         if (args.length === 1) {
           return typeof args[0] === "string" && tools.isAmbiguous(args[0])
-            ? I.Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target)
-            : I.Reflect.construct(NativeDate, args, target);
+            ? I.nativeConstruct(NativeDate, [tools.parseLocal(args[0])], target)
+            : I.nativeConstruct(NativeDate, args, target);
         }
         if (args.length >= 2) {
           const timestamp = tools.wallToEpoch({
@@ -3269,10 +3376,11 @@
             second: args.length > 5 ? I.NumberCtor(args[5]) : 0,
             millisecond: args.length > 6 ? I.NumberCtor(args[6]) : 0,
           });
-          return I.Reflect.construct(NativeDate, [timestamp], target);
+          return I.nativeConstruct(NativeDate, [timestamp], target);
         }
-        return I.Reflect.construct(NativeDate, args, target);
+        return I.nativeConstruct(NativeDate, args, target);
       };
+      WrappedDate = I.guardConstructor(WrappedDate);
       mark(WrappedDate, "Date", NativeDate.length);
       I.Object.setPrototypeOf(WrappedDate, I.Object.getPrototypeOf(NativeDate));
       for (let _index42 = 0, _items42 = I.list(I.Reflect.ownKeys(NativeDate)); _index42 < _items42.length; _index42++) {
@@ -3326,7 +3434,7 @@
             }
             args[optionsIndex] = I.withTimezone(args[optionsIndex], config.timezone);
           }
-          return I.Reflect.apply(nativeMethod, this, args);
+          return I.nativeApply(nativeMethod, this, args);
         },
       }[property], property, nativeMethod.length);
     };
@@ -3345,7 +3453,7 @@
         importScripts() {
           const urls = I.methods.map(arguments, (url) =>
             new URL(I.StringCtor(url), config.baseUrl).href);
-          return I.Reflect.apply(nativeImportScripts, self, urls);
+          return I.nativeApply(nativeImportScripts, self, urls);
         },
       }.importScripts, "importScripts");
     }
@@ -3385,17 +3493,17 @@
     const nativeRevokeObjectURL = NativeURL.revokeObjectURL;
 
     installOverride(NativeURL, "createObjectURL", function createObjectURL(value) {
-      const url = I.Reflect.apply(nativeCreateObjectURL, NativeURL, [value]);
+      const url = I.nativeApply(nativeCreateObjectURL, NativeURL, [value]);
       if (value instanceof NativeBlob) I.Mapset(trackedWorkerBlobs, url, value);
       return url;
     }, 1);
     installOverride(NativeURL, "revokeObjectURL", function revokeObjectURL(url) {
       const rawUrl = I.StringCtor(url);
-      const result = I.Reflect.apply(nativeRevokeObjectURL, NativeURL, [rawUrl]);
+      const result = I.nativeApply(nativeRevokeObjectURL, NativeURL, [rawUrl]);
       I.Mapdelete(trackedWorkerBlobs, rawUrl);
       const patched = I.Mapget(sharedWorkerUrls, rawUrl);
       if (patched) {
-        I.Reflect.apply(nativeRevokeObjectURL, NativeURL, [patched]);
+        I.nativeApply(nativeRevokeObjectURL, NativeURL, [patched]);
         I.Mapdelete(sharedWorkerUrls, rawUrl);
       }
       return result;
@@ -3406,13 +3514,13 @@
       const NativeWorker = realm[property];
       if (typeof NativeWorker !== "function") continue;
       const shared = property === "SharedWorker";
-      const WrappedWorker = function (...originalArgs) {
-        if (!new.target) return I.Reflect.apply(NativeWorker, this, arguments);
+      let WrappedWorker = function (...originalArgs) {
+        if (!new.target) return I.nativeApply(NativeWorker, this, arguments);
         const scriptURL = originalArgs[0];
         const options = originalArgs[1];
         const args = I.methods.slice(originalArgs);
         const target = new.target === WrappedWorker ? NativeWorker : new.target;
-        const construct = () => I.Reflect.construct(NativeWorker, originalArgs, target);
+        const construct = () => I.nativeConstruct(NativeWorker, originalArgs, target);
         const constructPatched = () => {
           let optionGetterThrew = false;
           const patchedArgs = I.methods.slice(args);
@@ -3422,7 +3530,7 @@
               catch (error) { optionGetterThrew = true; throw error; }
             } });
           }
-          try { return I.Reflect.construct(NativeWorker, patchedArgs, target); }
+          try { return I.nativeConstruct(NativeWorker, patchedArgs, target); }
           catch (error) {
             // A generated Blob URL is a string, not the page's TrustedScriptURL.
             // Fall back only for the native TT sink rejection, not arbitrary
@@ -3472,7 +3580,7 @@
             // Static dependencies execute in source order. A separate first
             // dependency installs the mask before the original module (and its
             // dependencies). Dynamic import can miss SharedWorker connect events.
-            const prelude = I.Reflect.apply(nativeCreateObjectURL, NativeURL,
+            const prelude = I.nativeApply(nativeCreateObjectURL, NativeURL,
               [new NativeBlob([payload], { type: "text/javascript" })]);
             parts = ["import " + I.JSON.stringify(prelude) + ";\nimport " + I.JSON.stringify(absoluteUrl) + ";"];
           } else {
@@ -3483,11 +3591,12 @@
         // Reuse the wrapper URL: SharedWorker identity is (URL, name). A fresh
         // Blob URL per call would silently create separate workers or throw.
         const blob = new NativeBlob(parts, { type: "text/javascript" });
-        const patched = I.Reflect.apply(nativeCreateObjectURL, NativeURL, [blob]);
+        const patched = I.nativeApply(nativeCreateObjectURL, NativeURL, [blob]);
         if (shared) I.Mapset(sharedWorkerUrls, cacheKey, patched);
         args[0] = patched;
         return constructPatched();
       };
+      WrappedWorker = I.guardConstructor(WrappedWorker);
       registerOverride(WrappedWorker, property);
       disguiseAsNative(WrappedWorker, property, NativeWorker.length);
       I.Object.setPrototypeOf(WrappedWorker, I.Object.getPrototypeOf(NativeWorker));
