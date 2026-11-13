@@ -7,9 +7,35 @@ npm install --no-save playwright@1.62.1
 npx playwright install chromium
 node tests/browser-regressions.cjs
 node tests/date-and-realms.cjs
+node tests/review-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.6 验证结果
+
+实际浏览器：Edge 157.0.4341.46。新增 `review-regressions.cjs` 15 组全部通过，既有两套测试分别 24/24、34/34 通过。
+
+- 强制 `require-trusted-types-for 'script'`：Worker/SharedWorker、URL 实验开关关闭/开启、可信 Blob URL、SharedWorker 重复连接、构造器子类；不可信字符串仍被拒绝，不创建宽松 policy。页面选项 getter 抛出的 TypeError 不重试。
+- `Temporal.Instant#toLocaleString`：主页面、嵌套 iframe、Worker、SharedWorker；默认/显式时区、关闭/排除、继承选项、冻结的 `timeZone: undefined`、getter 单次调用、参数错误、页面异常身份和函数外观。
+- DocumentFragment、多 iframe、移动/重新插入、TrustedHTML 的四种插入位置保持同步。调用计数断言确认追加普通节点不扫描旧文档、也不读取已有 iframe。相同场景下 v1.0.5 有 2600 次旧文档查询、26000 次已有 iframe 读取，修复后均为 0。
+- 使用 `VLM_SOURCE` 指向提交 `9253b5b` 的 v1.0.5 脚本，新增 15 组有 9 组失败，覆盖本次三项报告；修复后 15/15 通过。
+
+性能基准：初始约 22000 个元素（11000 个 `<div><i></i></div>`），另加 0/10/40 个 iframe；每格为三个新建页面测量的中位数，单位 ms。仅计同步 DOM 调用耗时，不计脚本初始化、布局绘制或后续微任务；短时测量会受 JIT 和系统调度影响，不代表手机实测。
+
+| iframe 数 | 版本 | appendChild × 2000 | insertAdjacentHTML × 200 | append 文本 × 200 |
+| --- | --- | ---: | ---: | ---: |
+| 0 | 无脚本 | 0.7 | 0.5 | <0.1 |
+| 0 | v1.0.5 | 108.4 | 24.5 | 11.2 |
+| 0 | v1.0.6 | 3.9 | 1.6 | 0.3 |
+| 10 | 无脚本 | 0.7 | 0.6 | <0.1 |
+| 10 | v1.0.5 | 123.1 | 25.7 | 12.7 |
+| 10 | v1.0.6 | 1.6 | 1.2 | 0.5 |
+| 40 | 无脚本 | 0.6 | 0.6 | 0.1 |
+| 40 | v1.0.5 | 169.9 | 35.0 | 16.5 |
+| 40 | v1.0.6 | 5.3 | 1.8 | 0.2 |
+
+`review-regressions.cjs` 默认包含性能基准，需要 Git 历史中的 v1.0.5 提交 `9253b5b`；设置 `VLM_SKIP_BENCH=1` 可只跑功能与调用计数断言。基准不以易波动的毫秒阈值决定测试成败。
 
 ## v1.0.5 验证结果
 

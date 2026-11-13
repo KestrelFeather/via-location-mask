@@ -17,7 +17,7 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 
 - `getCurrentPosition`、`watchPosition`、`clearWatch` 与定位权限状态。
 - 稳定的近似位置和坐标精度设置。
-- Date、Intl、Temporal.Now、IANA 时区及可选语言一致性。
+- Date、Intl、Temporal.Now、Temporal.Instant 格式化、IANA 时区及可选语言一致性。
 - 递归同源 iframe、Blob/Data/Module Worker 与 SharedWorker，以及可选的实验性 URL Worker。
 - 城市搜索、坐标到时区解析、地点配置档。
 - VPN 公网出口一键同步，以及页面运行期间的可选自动检查。
@@ -30,6 +30,7 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 跨域 iframe 和 Service Worker 无法覆盖，URL Worker 为实验性功能。
 - Temporal、SharedWorker 仅在浏览器原生提供时包装，不会为不支持的 WebView 添加 API。同一注入实例管理的 SharedWorker 连接复用替换后的 URL；不同标签页或独立注入实例之间的共享身份无法保证。
 - iframe 的同步覆盖发生在 DOM 插入方法返回前；不保证覆盖 HTML 解析器或插入过程中已经执行的子页面脚本。MutationObserver 和 load 监听继续作为补充。
+- 强制 Trusted Types 的页面拒绝补丁 Blob URL 时，会用页面原始参数创建 Worker，以保留网站功能；该 Worker 使用原生环境，不保证时区/语言伪装。脚本不会创建宽松的 Trusted Types policy。
 - Via 没有扩展后台任务；VPN 自动同步只在至少一个网页标签运行时工作。
 - 页面运行中更新时区和语言后，Date 和新建 Intl 对象会使用当前设置；已有 Intl 实例及已启动的 Worker 保留创建时的设置，刷新页面可统一更新。
 - Via 原生设置已禁用 WebRTC，本项目不实现 WebRTC 包装。
@@ -48,6 +49,14 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 随后可能依次把该 IP 发送给一个或多个 IP 地理服务（FreeIPAPI、GeoJS、ReallyFreeGeoIP、ipinfo），成功后停止；结果缓存 30 天。
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
+
+## v1.0.6 修复
+
+- 修复 v1.0.5 的 Trusted Types 回归：Worker/SharedWorker 的原样创建分支保留原始 `TrustedScriptURL` 及参数；生成的补丁 URL 被原生 Trusted Types 校验拒绝时，退回原始参数创建。页面选项 getter 抛出的错误不触发重试。
+- 修复同步 iframe 拦截的 DOM 性能回归：节点类接口只收集插入节点中的 iframe，DocumentFragment 在插入前收集；HTML 类接口及 `document.write/writeln` 同步读取本次操作的 mutation records，只处理新增内容。异步观察器跳过已处理 iframe，移动/重新插入和 load 事件仍会检查新页面。
+- 补齐主页面、同源 iframe、Worker 和 SharedWorker 的 `Temporal.Instant.prototype.toLocaleString()`：省略 `timeZone` 时使用伪装时区；保留显式时区、继承/冻结选项、getter 调用顺序及原生参数错误。
+
+Edge 157.0.4341.46：新增 15 组回归、既有 24 组 API 回归和 34 组日期基线/realm 回归全部通过。约 2.2 万节点的同机基准中，追加 2000 个节点从 v1.0.5 的约 108–170 ms 降至约 1.6–5.3 ms；具体测试条件及结果见 [测试说明](tests/README.md)。尚未在 Via/Android 真机验证。
 
 ## v1.0.5 修复
 
