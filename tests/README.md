@@ -9,9 +9,25 @@ node tests/browser-regressions.cjs
 node tests/date-and-realms.cjs
 node tests/review-regressions.cjs
 node tests/hardening-regressions.cjs
+node tests/intrinsic-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.8 验证结果
+
+实际浏览器：Edge 157.0.4341.46。`intrinsic-regressions.cjs` 8/8 组通过；既有四套分别为 24/24、15/15、32/32、34/34，总计 113 组。日期套件默认仍是 v1.0.4 基线一致性，不表示历史原生日期差异已修复。
+
+- 替换 `WeakMap.prototype.get = () => undefined` 后，Date 与 getCurrentPosition 的 `toString` 仍为原生外观。
+- 将 Reflect、Object、WeakMap/WeakSet/Map/Set、Array、Function.bind、String/RegExp 的所测方法，以及 Array/Set/Map/NodeList 迭代器替换为计数函数或抛错函数。DOM 中还替换 NodeList.length getter。使用允许列表，覆盖规则解析而非只测默认全站模式。
+- 执行日期取值、文本格式化、本地时间构造和 setter、Temporal.Instant 格式化、iframe 插入与嵌套、一次定位和一次监听，以及启动新 Worker。所测入口调用数均为 0；Reflect.apply 挂钩未截获任何内部实现函数。
+- Worker 和 SharedWorker 中由被加载脚本安装同样的挂钩，日期、Temporal 和函数外观保持正确，调用数及截获数均为 0。
+- 额外检查设置规范化、语言列表、网站规则去重和带方向字母的度分秒坐标解析。测试专用入口只加入浏览器 fixture，不写入分发脚本。
+- `VLM_SOURCE` 指向原始 v1.0.7（`e0eefc4`）时，同一套新增测试为 1 组通过、7 组失败，检出函数源码泄漏与运行时挂钩。
+
+按下文相同的大型 DOM 基准复核（三次中位数、0/10/40 个 iframe）：本版 appendChild × 2000 为 3.6/1.7/5.4 ms，insertAdjacentHTML × 200 为 1.5/1.3/4.3 ms，append 文本 × 200 为 0.3/0.1/0.2 ms。追加普通节点不扫描旧文档、也不读取已有 iframe 的调用计数断言继续通过。毫秒数据仅为桌面短时测量，不能代替手机实测。
+
+该套件验证列出的 API 路径及挂钩集合，不等同于对所有网页内置对象、所有隐式协议或所有指纹探测的证明。原生引用必须在页面替换之前保存；Via/Android 真机尚未验证。
 
 ## v1.0.7 验证结果
 

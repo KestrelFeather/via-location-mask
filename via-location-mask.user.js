@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.7
+// @version      1.0.8
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -60,7 +60,194 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.0.7";
+  // Private, startup-only snapshot. Never pass this object to page callbacks.
+  // The same factory is serialized into workers before their scripts execute.
+  function captureIntrinsics(root) {
+    const apply = root.Reflect.apply;
+    const ownNames = root.Object.getOwnPropertyNames;
+    const descriptor = root.Object.getOwnPropertyDescriptor;
+    const create = root.Object.create;
+    const isArray = root.Array.isArray;
+    const I = create(null);
+    const uncurried = (fn) => (receiver, ...args) => apply(fn, receiver, args);
+    const snapshot = (object) => {
+      const copy = create(null);
+      const names = ownNames(object);
+      for (let index = 0; index < names.length; index++) {
+        const entry = descriptor(object, names[index]);
+        if (entry && "value" in entry) copy[names[index]] = entry.value;
+      }
+      return copy;
+    };
+    I.Reflect = snapshot(root.Reflect);
+    I.Object = snapshot(root.Object);
+    I.Array = snapshot(root.Array);
+    I.Number = snapshot(root.Number);
+    I.Math = snapshot(root.Math);
+    I.JSON = snapshot(root.JSON);
+    I.Proxy = root.Proxy;
+    I.ObjectCtor = root.Object;
+    I.NumberCtor = root.Number;
+    I.BooleanCtor = root.Boolean;
+    I.StringCtor = root.String;
+    I.RegExp = root.RegExp;
+    I.bind = uncurried(root.Function.prototype.bind);
+    I.hasOwn = uncurried(root.Object.prototype.hasOwnProperty);
+    I.lookupGetter = uncurried(root.Object.prototype.__lookupGetter__);
+    const WeakMapCtor = root.WeakMap, WeakSetCtor = root.WeakSet;
+    const MapCtor = root.Map, SetCtor = root.Set;
+    const collectionTypes = ["WeakMap", "WeakSet", "Map", "Set"];
+    const collectionMethods = ["get", "set", "has", "add", "delete", "clear", "forEach"];
+    for (let t = 0; t < collectionTypes.length; t++) {
+      const type = collectionTypes[t], proto = root[type].prototype;
+      for (let m = 0; m < collectionMethods.length; m++) {
+        const method = collectionMethods[m];
+        if (typeof proto[method] === "function") I[type + method] = uncurried(proto[method]);
+      }
+    }
+    const nodeListLength = root.NodeList && descriptor(root.NodeList.prototype, "length").get;
+    const htmlCollectionLength = root.HTMLCollection && descriptor(root.HTMLCollection.prototype, "length").get;
+    I.list = (value) => {
+      const result = [];
+      if (isArray(value) || typeof value === "string") {
+        for (let index = 0; index < value.length; index++) result[index] = value[index];
+        return result;
+      }
+      if (value instanceof SetCtor) {
+        I.SetforEach(value, (item) => { result[result.length] = item; });
+        return result;
+      }
+      if (value instanceof MapCtor) {
+        I.MapforEach(value, (item, key) => { result[result.length] = [key, item]; });
+        return result;
+      }
+      let length;
+      if (nodeListLength) {
+        try { length = apply(nodeListLength, value, []); } catch (_) {}
+      }
+      if (length === undefined && htmlCollectionLength) {
+        try { length = apply(htmlCollectionLength, value, []); } catch (_) {}
+      }
+      if (length === undefined) length = value.length; // arguments / private array-like
+      for (let index = 0; index < length; index++) result[index] = value[index];
+      return result;
+    };
+    I.newWeakMap = () => new WeakMapCtor();
+    I.newMap = () => new MapCtor();
+    I.newWeakSet = (values) => {
+      const result = new WeakSetCtor();
+      if (values) for (let index = 0; index < values.length; index++) I.WeakSetadd(result, values[index]);
+      return result;
+    };
+    I.newSet = (values) => {
+      const result = new SetCtor();
+      if (values) for (let index = 0; index < values.length; index++) I.Setadd(result, values[index]);
+      return result;
+    };
+    I.Array.from = I.list;
+    I.Object.fromEntries = (entries) => {
+      const result = {};
+      for (let index = 0; index < entries.length; index++) {
+        I.Object.defineProperty(result, entries[index][0], {
+          value: entries[index][1], writable: true, enumerable: true, configurable: true,
+        });
+      }
+      return result;
+    };
+    const arrayMethods = ["slice", "map", "filter", "some", "every", "find", "findIndex", "forEach",
+      "push", "sort", "splice", "join", "concat", "includes", "indexOf"];
+    const stringMethods = ["slice", "includes", "indexOf", "concat", "charCodeAt", "endsWith", "startsWith",
+      "toLowerCase", "toUpperCase", "trim", "padStart", "split", "replace", "match", "matchAll"];
+    I.methods = create(null);
+    for (let index = 0; index < arrayMethods.length; index++) {
+      const name = arrayMethods[index], native = root.Array.prototype[name];
+      I.methods[name] = uncurried(native);
+    }
+    for (let index = 0; index < stringMethods.length; index++) {
+      const name = stringMethods[index], native = root.String.prototype[name];
+      const arrayMethod = root.Array.prototype[name];
+      I.methods[name] = (receiver, ...args) => apply(
+        typeof receiver === "string" || typeof arrayMethod !== "function" ? native : arrayMethod,
+        receiver, args);
+    }
+    I.methods.exec = uncurried(root.RegExp.prototype.exec);
+    I.methods.test = (receiver, value) => I.methods.exec(receiver, value) !== null;
+    // String's native match/replace/split still call RegExp.exec and @@species.
+    // Isolate our internal expressions so those implicit calls cannot escape
+    // through page replacements even though the outer String method was saved.
+    const NativeRegExp = root.RegExp, define = root.Object.defineProperty;
+    const regexSource = descriptor(NativeRegExp.prototype, "source").get;
+    const flagNames = ["hasIndices", "global", "ignoreCase", "multiline", "dotAll", "unicode", "unicodeSets", "sticky"];
+    const flagLetters = ["d", "g", "i", "m", "s", "u", "v", "y"];
+    const flagGetters = [];
+    for (let index = 0; index < flagNames.length; index++) {
+      const entry = descriptor(NativeRegExp.prototype, flagNames[index]);
+      flagGetters[index] = entry && entry.get;
+    }
+    const symbols = [root.Symbol.match, root.Symbol.matchAll, root.Symbol.replace, root.Symbol.search, root.Symbol.split];
+    const symbolMethods = [];
+    for (let index = 0; index < symbols.length; index++) symbolMethods[index] = NativeRegExp.prototype[symbols[index]];
+    const regexExec = NativeRegExp.prototype.exec;
+    function privateRegExp(pattern, flags) {
+      const value = new NativeRegExp(pattern, flags);
+      define(value, "exec", { value: regexExec });
+      define(value, "constructor", { value: privateRegExp });
+      let nativeFlags = "";
+      for (let index = 0; index < flagNames.length; index++) {
+        if (!flagGetters[index]) continue;
+        const enabled = apply(flagGetters[index], value, []);
+        define(value, flagNames[index], { value: enabled });
+        if (enabled) nativeFlags += flagLetters[index];
+      }
+      define(value, "flags", { value: nativeFlags });
+      for (let index = 0; index < symbols.length; index++) define(value, symbols[index], { value: symbolMethods[index] });
+      return value;
+    }
+    define(privateRegExp, root.Symbol.species, { value: privateRegExp });
+    const isolateRegex = (value) => {
+      let source;
+      try { source = apply(regexSource, value, []); } catch (_) { return value; }
+      let flags = "";
+      for (let index = 0; index < flagNames.length; index++) {
+        if (flagGetters[index] && apply(flagGetters[index], value, [])) flags += flagLetters[index];
+      }
+      const result = privateRegExp(source, flags);
+      result.lastIndex = value.lastIndex;
+      return result;
+    };
+    const regexStringNames = ["match", "replace", "split"];
+    for (let index = 0; index < regexStringNames.length; index++) {
+      const name = regexStringNames[index], native = root.String.prototype[name];
+      I.methods[name] = (receiver, ...args) => {
+        args[0] = isolateRegex(args[0]);
+        return apply(native, receiver, args);
+      };
+    }
+    const matchAll = root.String.prototype.matchAll;
+    const matchNext = root.Object.getPrototypeOf(apply(matchAll, "", [/(?:)/g])).next;
+    I.methods.matchAll = (receiver, expression) => {
+      const iterator = apply(matchAll, receiver, [isolateRegex(expression)]), result = [];
+      for (;;) {
+        const step = apply(matchNext, iterator, []);
+        if (step.done) return result;
+        result[result.length] = step.value;
+      }
+    };
+    I.methods.toFixed = uncurried(root.Number.prototype.toFixed);
+    const dateNames = ["getTime", "getUTCDate", "getUTCDay", "getUTCFullYear", "getUTCHours",
+      "getUTCMilliseconds", "getUTCMinutes", "getUTCMonth", "getUTCSeconds", "setUTCFullYear", "setUTCHours"];
+    for (let index = 0; index < dateNames.length; index++) I.methods[dateNames[index]] = uncurried(root.Date.prototype[dateNames[index]]);
+    I.dateNow = root.Date.now;
+    I.dateUTC = root.Date.UTC;
+    I.dateParse = root.Date.parse;
+    I.formatToParts = uncurried(root.Intl.DateTimeFormat.prototype.formatToParts);
+    I.resolvedOptions = uncurried(root.Intl.DateTimeFormat.prototype.resolvedOptions);
+    return I;
+  }
+
+  const I = captureIntrinsics(globalThis);
+
+  const VERSION = "1.0.8";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -77,9 +264,9 @@
   const realmPrePatched = !(initialToString instanceof Function);
   // Captured before page code runs; a page can shadow window.length but not
   // this native getter, and indexed child access on a WindowProxy is unhookable.
-  const nativeWindowLength = Object.getOwnPropertyDescriptor(window, "length").get;
-  const nativeFunctionSource = Reflect.apply(initialToString, Function, []);
-  const DEFAULT_SETTINGS = Object.freeze({
+  const nativeWindowLength = I.Object.getOwnPropertyDescriptor(window, "length").get;
+  const nativeFunctionSource = I.Reflect.apply(initialToString, Function, []);
+  const DEFAULT_SETTINGS = I.Object.freeze({
     enabled: false,
     latitude: 25.033,
     longitude: 121.5654,
@@ -107,44 +294,44 @@
   // Capture the entropy source before page code can wrap it. Do not consume
   // the page's observable Math.random stream, even as a fallback.
   const randomFill = window.crypto && typeof window.crypto.getRandomValues === "function"
-    ? window.crypto.getRandomValues.bind(window.crypto) : null;
+    ? I.bind(window.crypto.getRandomValues, window.crypto) : null;
   const randomBuffer = new Uint32Array(2);
   function randomUnit() {
     if (!randomFill) return 0.5;
     randomFill(randomBuffer);
     return ((randomBuffer[0] >>> 5) * 67108864 + (randomBuffer[1] >>> 6)) / 9007199254740992;
   }
-  const nativeGeoErrors = new WeakSet();
+  const nativeGeoErrors = I.newWeakSet();
   const captureStackTrace = Error.captureStackTrace;
-  const coveredIframeRealms = new WeakSet();
-  const iframeObserverApis = new WeakMap();
-  const observedIframeDocuments = new WeakSet();
-  const watchedIframes = new WeakSet();
-  const trackedWorkerBlobs = new Map();
-  const sharedWorkerUrls = new Map();
+  const coveredIframeRealms = I.newWeakSet();
+  const iframeObserverApis = I.newWeakMap();
+  const observedIframeDocuments = I.newWeakSet();
+  const watchedIframes = I.newWeakSet();
+  const trackedWorkerBlobs = I.newMap();
+  const sharedWorkerUrls = I.newMap();
 
   const originals = {
     functionToString: initialToString,
     functionCall: Function.prototype.call,
   };
-  const overrideRegistry = new WeakMap();
-  const patchedRealms = new WeakSet();
+  const overrideRegistry = I.newWeakMap();
+  const patchedRealms = I.newWeakSet();
   // Genuine Function.prototype objects of same-origin realms in this tab. Masks
   // only look for another instance's mask on these, never on arbitrary
   // (possibly proxied) prototypes a page can attach to its own functions.
-  const knownRealms = new WeakSet([Function.prototype]);
+  const knownRealms = I.newWeakSet([Function.prototype]);
   // Source text shared by every mask this script version installs; used to
   // recognize masks without ever calling page code. When an ancestor's mask
   // is already installed here it still reports this unregistered function's
   // real source.
-  const maskSource = Reflect.apply(
+  const maskSource = I.Reflect.apply(
     initialToString,
     createMaskedToString(initialToString, "", ""),
     []
   );
-  const syntheticWatchStops = new Set();
-  const coordsSlots = new WeakMap();
-  const positionSlots = new WeakMap();
+  const syntheticWatchStops = I.newSet();
+  const coordsSlots = I.newWeakMap();
+  const positionSlots = I.newWeakMap();
   let paddedCoordinateCache = null;
   let settings = readSettings();
 
@@ -154,10 +341,10 @@
       // Hashed so the marks never keep a readable browsing history.
       const key = hashText(location.href + "|" + performance.timeOrigin);
       const saved = GM_getValue(INSTANCE_MARKS_KEY, null);
-      const marks = Array.isArray(saved) ? saved : typeof saved === "string" ? JSON.parse(saved) : [];
-      if (!Array.isArray(marks)) return true;
-      if (marks.includes(key)) return false;
-      GM_setValue(INSTANCE_MARKS_KEY, JSON.stringify([key].concat(marks).slice(0, 200)));
+      const marks = I.Array.isArray(saved) ? saved : typeof saved === "string" ? I.JSON.parse(saved) : [];
+      if (!I.Array.isArray(marks)) return true;
+      if (I.methods.includes(marks, key)) return false;
+      GM_setValue(INSTANCE_MARKS_KEY, I.JSON.stringify(I.methods.slice(I.methods.concat([key], marks), 0, 200)));
     } catch (_) {
       // Without a mark a re-injection only layers a second, still consistent patch.
     }
@@ -168,12 +355,12 @@
     let first = 0xdeadbeef;
     let second = 0x41c6ce57;
     for (let index = 0; index < text.length; index += 1) {
-      const code = text.charCodeAt(index);
-      first = Math.imul(first ^ code, 2654435761);
-      second = Math.imul(second ^ code, 1597334677);
+      const code = I.methods.charCodeAt(text, index);
+      first = I.Math.imul(first ^ code, 2654435761);
+      second = I.Math.imul(second ^ code, 1597334677);
     }
-    first = Math.imul(first ^ (first >>> 16), 2246822507) ^ Math.imul(second ^ (second >>> 13), 3266489909);
-    second = Math.imul(second ^ (second >>> 16), 2246822507) ^ Math.imul(first ^ (first >>> 13), 3266489909);
+    first = I.Math.imul(first ^ (first >>> 16), 2246822507) ^ I.Math.imul(second ^ (second >>> 13), 3266489909);
+    second = I.Math.imul(second ^ (second >>> 16), 2246822507) ^ I.Math.imul(first ^ (first >>> 13), 3266489909);
     return (4294967296 * (2097151 & second) + (first >>> 0)).toString(36);
   }
 
@@ -185,23 +372,23 @@
     let delegating = false;
     const maskedToString = {
       toString() {
-        const name = overrideRegistry.get(this);
+        const name = I.WeakMapget(overrideRegistry, this);
         if (name !== undefined) return nativePrefix + name + nativeSuffix;
-        const source = Reflect.apply(nativeToString, this, []);
+        const source = I.Reflect.apply(nativeToString, this, []);
         // Native functions, bound functions and proxies need no lookup, and
         // skipping them keeps proxy traps from observing the calls below.
-        if (delegating || !maskSource || /\[native code\]\s*\}$/.test(source)) return source;
-        const prototype = Reflect.getPrototypeOf(this);
+        if (delegating || !maskSource || I.methods.test(/\[native code\]\s*\}$/, source)) return source;
+        const prototype = I.Reflect.getPrototypeOf(this);
         // Frames (siblings included) may have appeared since the last walk.
-        if (!knownRealms.has(prototype)) discoverRealms();
-        if (!knownRealms.has(prototype)) return source;
-        const descriptor = Reflect.getOwnPropertyDescriptor(prototype, "toString");
+        if (!I.WeakSethas(knownRealms, prototype)) discoverRealms();
+        if (!I.WeakSethas(knownRealms, prototype)) return source;
+        const descriptor = I.Reflect.getOwnPropertyDescriptor(prototype, "toString");
         const owner = descriptor && descriptor.value;
         if (typeof owner !== "function" || owner === maskedToString ||
-            Reflect.apply(nativeToString, owner, []) !== maskSource) return source;
+            I.Reflect.apply(nativeToString, owner, []) !== maskSource) return source;
         delegating = true;
         try {
-          return Reflect.apply(owner, this, []);
+          return I.Reflect.apply(owner, this, []);
         } finally {
           delegating = false;
         }
@@ -215,11 +402,11 @@
   // native Function (a proxy or page function stringifies differently).
   function genuineFunctionPrototype(realm) {
     try {
-      const descriptor = Reflect.getOwnPropertyDescriptor(realm, "Function");
+      const descriptor = I.Reflect.getOwnPropertyDescriptor(realm, "Function");
       const constructor = descriptor && descriptor.value;
       if (typeof constructor !== "function" ||
-          Reflect.apply(initialToString, constructor, []) !== nativeFunctionSource) return null;
-      const prototypeDescriptor = Reflect.getOwnPropertyDescriptor(constructor, "prototype");
+          I.Reflect.apply(initialToString, constructor, []) !== nativeFunctionSource) return null;
+      const prototypeDescriptor = I.Reflect.getOwnPropertyDescriptor(constructor, "prototype");
       return prototypeDescriptor ? prototypeDescriptor.value : null;
     } catch (_) {
       return null;  // Cross-origin.
@@ -231,11 +418,11 @@
   function discoverRealms() {
     const visit = (frame, depth) => {
       const prototype = genuineFunctionPrototype(frame);
-      if (prototype) knownRealms.add(prototype);
+      if (prototype) I.WeakSetadd(knownRealms, prototype);
       if (depth > 32) return;
       let count = 0;
       try {
-        count = Reflect.apply(nativeWindowLength, frame, []);
+        count = I.Reflect.apply(nativeWindowLength, frame, []);
       } catch (_) {
         return;
       }
@@ -257,29 +444,29 @@
   }
 
   function realmMasked(functionPrototype) {
-    const descriptor = Reflect.getOwnPropertyDescriptor(functionPrototype, "toString");
+    const descriptor = I.Reflect.getOwnPropertyDescriptor(functionPrototype, "toString");
     const current = descriptor && descriptor.value;
     if (typeof current !== "function") return false;
-    if (overrideRegistry.has(current)) return true;
-    return !!maskSource && Reflect.apply(initialToString, current, []) === maskSource;
+    if (I.WeakMaphas(overrideRegistry, current)) return true;
+    return !!maskSource && I.Reflect.apply(initialToString, current, []) === maskSource;
   }
 
   function log(...args) {
-    if (settings.debug) console.debug("[Via Location Mask]", ...args);
+    if (settings.debug) I.Reflect.apply(console.debug, console, I.methods.concat(["[Via Location Mask]"], args));
   }
 
   function finiteNumber(value, fallback) {
-    const number = typeof value === "number" ? value : Number(value);
-    return Number.isFinite(number) ? number : fallback;
+    const number = typeof value === "number" ? value : I.NumberCtor(value);
+    return I.Number.isFinite(number) ? number : fallback;
   }
 
   function randomSeed() {
-    return Math.floor(randomUnit() * 0xffffffff) + 1;
+    return I.Math.floor(randomUnit() * 0xffffffff) + 1;
   }
 
   function canonicalLanguage(value, fallback) {
     try {
-      return Intl.getCanonicalLocales(String(value || "").trim())[0] || fallback;
+      return Intl.getCanonicalLocales(I.methods.trim(I.StringCtor(value || "")))[0] || fallback;
     } catch (_) {
       return fallback;
     }
@@ -287,43 +474,44 @@
 
   function canonicalTimezone(value, fallback) {
     try {
-      return new Intl.DateTimeFormat("en-US", {
-        timeZone: String(value || "").trim(),
-      }).resolvedOptions().timeZone;
+      return I.resolvedOptions(new Intl.DateTimeFormat("en-US", {
+        timeZone: I.methods.trim(I.StringCtor(value || "")),
+      })).timeZone;
     } catch (_) {
       return fallback;
     }
   }
 
   function normalizeLanguageList(primary, input) {
-    const raw = Array.isArray(input)
+    const raw = I.Array.isArray(input)
       ? input
       : typeof input === "string"
-        ? input.split(/[,\s]+/)
+        ? I.methods.split(input, /[,\s]+/)
         : [];
     const result = [];
-    for (const item of [primary, ...raw]) {
+    for (let _index1 = 0, _items1 = I.list(I.methods.concat([primary], raw)); _index1 < _items1.length; _index1++) {
+      const item = _items1[_index1];
       const canonical = canonicalLanguage(item, "");
-      if (canonical && !result.includes(canonical)) result.push(canonical);
+      if (canonical && !I.methods.includes(result, canonical)) I.methods.push(result, canonical);
     }
     return result.length ? result : [primary];
   }
 
   function normalizeProfile(input, index) {
     if (!input || typeof input !== "object") return null;
-    const name = String(input.name || "配置档 " + (index + 1)).trim().slice(0, 40);
+    const name = I.methods.slice(I.methods.trim(I.StringCtor(input.name || "配置档 " + (index + 1))), 0, 40);
     if (!name) return null;
     const language = canonicalLanguage(input.language, DEFAULT_SETTINGS.language);
     return {
       name,
-      latitude: Math.max(-90, Math.min(90, finiteNumber(input.latitude, DEFAULT_SETTINGS.latitude))),
-      longitude: Math.max(
+      latitude: I.Math.max(-90, I.Math.min(90, finiteNumber(input.latitude, DEFAULT_SETTINGS.latitude))),
+      longitude: I.Math.max(
         -180,
-        Math.min(180, finiteNumber(input.longitude, DEFAULT_SETTINGS.longitude))
+        I.Math.min(180, finiteNumber(input.longitude, DEFAULT_SETTINGS.longitude))
       ),
-      accuracy: Math.max(
+      accuracy: I.Math.max(
         1,
-        Math.min(100000, Math.round(finiteNumber(input.accuracy, DEFAULT_SETTINGS.accuracy)))
+        I.Math.min(100000, I.Math.round(finiteNumber(input.accuracy, DEFAULT_SETTINGS.accuracy)))
       ),
       language,
       languages: normalizeLanguageList(language, input.languages),
@@ -332,56 +520,56 @@
   }
 
   function escapePatternText(value) {
-    return value.replace(/[.*+?^{}()|[\]\\$]/g, "\\$&");
+    return I.methods.replace(value, /[.*+?^{}()|[\]\\$]/g, "\\$&");
   }
 
   function parseSitePattern(input) {
-    const source = String(input || "").trim();
-    if (!source || source.includes("?") || source.includes("#") || source.includes("\\")) {
+    const source = I.methods.trim(I.StringCtor(input || ""));
+    if (!source || I.methods.includes(source, "?") || I.methods.includes(source, "#") || I.methods.includes(source, "\\")) {
       return null;
     }
     let rest = source;
     let scheme = null;
-    const schemeMatch = /^(\*|https?):\/\//i.exec(rest);
+    const schemeMatch = I.methods.exec(/^(\*|https?):\/\//i, rest);
     if (schemeMatch) {
-      scheme = schemeMatch[1].toLowerCase();
-      rest = rest.slice(schemeMatch[0].length);
-    } else if (rest.includes("://")) {
+      scheme = I.methods.toLowerCase(schemeMatch[1]);
+      rest = I.methods.slice(rest, schemeMatch[0].length);
+    } else if (I.methods.includes(rest, "://")) {
       return null;
     }
-    const slash = rest.indexOf("/");
-    let hostPort = slash === -1 ? rest : rest.slice(0, slash);
-    let pathPattern = slash === -1 ? null : rest.slice(slash);
+    const slash = I.methods.indexOf(rest, "/");
+    let hostPort = slash === -1 ? rest : I.methods.slice(rest, 0, slash);
+    let pathPattern = slash === -1 ? null : I.methods.slice(rest, slash);
     if (pathPattern === "/") pathPattern = null;
     let port = null;
-    const portMatch = /:(\*|\d+)$/.exec(hostPort);
+    const portMatch = I.methods.exec(/:(\*|\d+)$/, hostPort);
     if (portMatch) {
       port = portMatch[1] === "*" ? null : portMatch[1];
-      hostPort = hostPort.slice(0, -portMatch[0].length);
-      if (port && (Number(port) < 1 || Number(port) > 65535)) return null;
+      hostPort = I.methods.slice(hostPort, 0, -portMatch[0].length);
+      if (port && (I.NumberCtor(port) < 1 || I.NumberCtor(port) > 65535)) return null;
     }
-    let host = hostPort.toLowerCase();
-    const subdomainsOnly = host.startsWith("*.");
-    if (subdomainsOnly) host = host.slice(2);
+    let host = I.methods.toLowerCase(hostPort);
+    const subdomainsOnly = I.methods.startsWith(host, "*.");
+    if (subdomainsOnly) host = I.methods.slice(host, 2);
     const anyHost = host === "*";
-    const ipv6 = host.startsWith("[") && host.endsWith("]");
-    if (!host || (!anyHost && host.includes("*")) || (!ipv6 && host.includes(":"))) return null;
+    const ipv6 = I.methods.startsWith(host, "[") && I.methods.endsWith(host, "]");
+    if (!host || (!anyHost && I.methods.includes(host, "*")) || (!ipv6 && I.methods.includes(host, ":"))) return null;
     if (ipv6 && subdomainsOnly) return null;
     let exactHostOnly = false;
     if (!anyHost) {
       try {
         const parsedHost = new URL("http://" + host);
         if (parsedHost.username || parsedHost.password || parsedHost.port) return null;
-        host = parsedHost.hostname.toLowerCase();
+        host = I.methods.toLowerCase(parsedHost.hostname);
       } catch (_) {
         return null;
       }
-      const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
-      exactHostOnly = ipv4 || ipv6 || !host.includes(".");
+      const ipv4 = I.methods.test(/^(?:\d{1,3}\.){3}\d{1,3}$/, host);
+      exactHostOnly = ipv4 || ipv6 || !I.methods.includes(host, ".");
     }
-    if (pathPattern && !pathPattern.startsWith("/")) return null;
+    if (pathPattern && !I.methods.startsWith(pathPattern, "/")) return null;
     const pathRegex = pathPattern
-      ? new RegExp("^" + pathPattern.split("*").map(escapePatternText).join(".*") + "$")
+      ? new I.RegExp("^" + I.methods.join(I.methods.map(I.methods.split(pathPattern, "*"), escapePatternText), ".*") + "$")
       : null;
     return {
       source, scheme, host, subdomainsOnly, anyHost, exactHostOnly, port, pathRegex,
@@ -397,28 +585,28 @@
     } catch (_) {
       return false;
     }
-    const protocol = target.protocol.slice(0, -1).toLowerCase();
-    if (!["http", "https"].includes(protocol)) return false;
+    const protocol = I.methods.toLowerCase(I.methods.slice(target.protocol, 0, -1));
+    if (!I.methods.includes(["http", "https"], protocol)) return false;
     if (parsed.scheme && parsed.scheme !== "*" && parsed.scheme !== protocol) return false;
-    const hostname = target.hostname.toLowerCase();
+    const hostname = I.methods.toLowerCase(target.hostname);
     const hostMatches = parsed.anyHost ||
       (parsed.subdomainsOnly
-        ? hostname.endsWith("." + parsed.host)
+        ? I.methods.endsWith(hostname, "." + parsed.host)
         : hostname === parsed.host ||
-          (!parsed.exactHostOnly && hostname.endsWith("." + parsed.host)));
+          (!parsed.exactHostOnly && I.methods.endsWith(hostname, "." + parsed.host)));
     if (!hostMatches) return false;
     if (parsed.port !== null) {
       const effectivePort = target.port || (protocol === "https" ? "443" : "80");
       if (effectivePort !== parsed.port) return false;
     }
-    return !parsed.pathRegex || parsed.pathRegex.test(target.pathname);
+    return !parsed.pathRegex || I.methods.test(parsed.pathRegex, target.pathname);
   }
 
   function siteRuleForUrl(url) {
     try {
       const target = new URL(url);
-      if (!["http:", "https:"].includes(target.protocol)) return "";
-      return target.hostname.toLowerCase() + (target.port ? ":" + target.port : "");
+      if (!I.methods.includes(["http:", "https:"], target.protocol)) return "";
+      return I.methods.toLowerCase(target.hostname) + (target.port ? ":" + target.port : "");
     } catch (_) {
       return "";
     }
@@ -427,61 +615,58 @@
   function protectionActive() {
     if (!settings.enabled) return false;
     if (settings.siteMode === "all") return true;
-    const matched = settings.sitePatterns.some((pattern) =>
-      sitePatternMatches(pattern, location.href)
-    );
+    const matched = I.methods.some(settings.sitePatterns, (pattern) =>
+      sitePatternMatches(pattern, location.href));
     return settings.siteMode === "allowlist" ? matched : !matched;
   }
 
   function validateSettings(input) {
     const raw = input && typeof input === "object" ? input : {};
     const language = canonicalLanguage(raw.language, DEFAULT_SETTINGS.language);
-    const rawLanguages = Array.isArray(raw.languages)
+    const rawLanguages = I.Array.isArray(raw.languages)
       ? raw.languages
       : typeof raw.languages === "string"
-        ? raw.languages.split(/[,\s]+/)
+        ? I.methods.split(raw.languages, /[,\s]+/)
         : DEFAULT_SETTINGS.languages;
     const languages = normalizeLanguageList(language, rawLanguages);
     const timezone = canonicalTimezone(raw.timezone, DEFAULT_SETTINGS.timezone);
-    const siteMode = ["all", "allowlist", "denylist"].includes(raw.siteMode)
+    const siteMode = I.methods.includes(["all", "allowlist", "denylist"], raw.siteMode)
       ? raw.siteMode
       : "all";
-    const sitePatterns = Array.isArray(raw.sitePatterns)
-      ? Array.from(new Set(raw.sitePatterns.map((value) => String(value).trim())))
-          .filter((value) => parseSitePattern(value))
-          .slice(0, 200)
+    const sitePatterns = I.Array.isArray(raw.sitePatterns)
+      ? I.methods.slice(I.methods.filter(I.Array.from(I.newSet(I.methods.map(raw.sitePatterns, (value) => I.methods.trim(I.StringCtor(value))))), (value) => parseSitePattern(value)), 0, 200)
       : [];
     const profiles = [];
-    const profileNames = new Set();
-    if (Array.isArray(raw.profiles)) {
+    const profileNames = I.newSet();
+    if (I.Array.isArray(raw.profiles)) {
       for (let index = 0; index < raw.profiles.length && profiles.length < 30; index += 1) {
         const profile = normalizeProfile(raw.profiles[index], index);
-        if (!profile || profileNames.has(profile.name)) continue;
-        profileNames.add(profile.name);
-        profiles.push(profile);
+        if (!profile || I.Sethas(profileNames, profile.name)) continue;
+        I.Setadd(profileNames, profile.name);
+        I.methods.push(profiles, profile);
       }
     }
     return {
       enabled: raw.enabled === true,
-      latitude: Math.max(
+      latitude: I.Math.max(
         -90,
-        Math.min(90, finiteNumber(raw.latitude, DEFAULT_SETTINGS.latitude))
+        I.Math.min(90, finiteNumber(raw.latitude, DEFAULT_SETTINGS.latitude))
       ),
-      longitude: Math.max(
+      longitude: I.Math.max(
         -180,
-        Math.min(180, finiteNumber(raw.longitude, DEFAULT_SETTINGS.longitude))
+        I.Math.min(180, finiteNumber(raw.longitude, DEFAULT_SETTINGS.longitude))
       ),
-      accuracy: Math.max(
+      accuracy: I.Math.max(
         1,
-        Math.min(100000, Math.round(finiteNumber(raw.accuracy, DEFAULT_SETTINGS.accuracy)))
+        I.Math.min(100000, I.Math.round(finiteNumber(raw.accuracy, DEFAULT_SETTINGS.accuracy)))
       ),
       approximateEnabled: raw.approximateEnabled === true,
-      approximateRadius: Math.max(
+      approximateRadius: I.Math.max(
         50,
-        Math.min(50000, Math.round(finiteNumber(raw.approximateRadius, 500)))
+        I.Math.min(50000, I.Math.round(finiteNumber(raw.approximateRadius, 500)))
       ),
       approximateSeed:
-        Number.isInteger(raw.approximateSeed) && raw.approximateSeed > 0
+        I.Number.isInteger(raw.approximateSeed) && raw.approximateSeed > 0
           ? raw.approximateSeed >>> 0 || 1
           : randomSeed(),
       preservePermissionPrompt: raw.preservePermissionPrompt === true,
@@ -496,9 +681,9 @@
       sitePatterns,
       profiles,
       vpnAutoSync: raw.vpnAutoSync === true,
-      vpnCheckMinutes: Math.max(
+      vpnCheckMinutes: I.Math.max(
         5,
-        Math.min(1440, Math.round(finiteNumber(raw.vpnCheckMinutes, 15)))
+        I.Math.min(1440, I.Math.round(finiteNumber(raw.vpnCheckMinutes, 15)))
       ),
       floatingButtonEnabled: raw.floatingButtonEnabled === true,
       debug: raw.debug === true,
@@ -510,7 +695,7 @@
       if (typeof GM_getValue !== "function") return { ...DEFAULT_SETTINGS };
       const saved = GM_getValue(STORAGE_KEY, null);
       if (saved == null) return { ...DEFAULT_SETTINGS };
-      if (typeof saved === "string") return validateSettings(JSON.parse(saved));
+      if (typeof saved === "string") return validateSettings(I.JSON.parse(saved));
       return validateSettings(saved);
     } catch (error) {
       console.warn("[Via Location Mask] Could not read settings:", error);
@@ -521,7 +706,7 @@
   function saveSettings(next) {
     const validated = validateSettings(next);
     if (typeof GM_setValue === "function") {
-      GM_setValue(STORAGE_KEY, JSON.stringify(validated));
+      GM_setValue(STORAGE_KEY, I.JSON.stringify(validated));
     }
     settings = validated;
     paddedCoordinateCache = null;
@@ -542,7 +727,7 @@
     try {
       if (typeof GM_getValue !== "function") return fallback;
       const saved = GM_getValue(UI_STATE_KEY, null);
-      const parsed = typeof saved === "string" ? JSON.parse(saved) : saved;
+      const parsed = typeof saved === "string" ? I.JSON.parse(saved) : saved;
       return parsed && typeof parsed === "object" ? { ...fallback, ...parsed } : fallback;
     } catch (_) {
       return fallback;
@@ -551,7 +736,7 @@
 
   function saveUiState(next) {
     if (typeof GM_setValue === "function") {
-      GM_setValue(UI_STATE_KEY, JSON.stringify(next));
+      GM_setValue(UI_STATE_KEY, I.JSON.stringify(next));
     }
   }
 
@@ -570,7 +755,7 @@
     try {
       if (typeof GM_getValue !== "function") return fallback;
       const saved = GM_getValue(NETWORK_KEY, null);
-      const parsed = typeof saved === "string" ? JSON.parse(saved) : saved;
+      const parsed = typeof saved === "string" ? I.JSON.parse(saved) : saved;
       return parsed && typeof parsed === "object" ? { ...fallback, ...parsed } : fallback;
     } catch (_) {
       return fallback;
@@ -579,16 +764,15 @@
 
   function saveNetworkState(state) {
     if (typeof GM_setValue === "function") {
-      GM_setValue(NETWORK_KEY, JSON.stringify(state));
+      GM_setValue(NETWORK_KEY, I.JSON.stringify(state));
     }
   }
 
   function trimCache(cache, maximumEntries) {
-    const entries = Object.entries(cache || {}).sort((left, right) =>
+    const entries = I.methods.sort(I.Object.entries(cache || {}), (left, right) =>
       finiteNumber(right[1] && right[1].cachedAt, 0) -
-      finiteNumber(left[1] && left[1].cachedAt, 0)
-    );
-    return Object.fromEntries(entries.slice(0, maximumEntries));
+      finiteNumber(left[1] && left[1].cachedAt, 0));
+    return I.Object.fromEntries(I.methods.slice(entries, 0, maximumEntries));
   }
 
   function wait(milliseconds) {
@@ -638,55 +822,54 @@
   async function requestJson(url, options) {
     const text = await requestText(url, options);
     try {
-      return JSON.parse(text);
+      return I.JSON.parse(text);
     } catch (_) {
       throw new Error("服务返回了无效 JSON");
     }
   }
 
   function validCoordinates(latitude, longitude) {
-    return Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 &&
-      Number.isFinite(longitude) && longitude >= -180 && longitude <= 180;
+    return I.Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 &&
+      I.Number.isFinite(longitude) && longitude >= -180 && longitude <= 180;
   }
 
   async function searchCities(query) {
-    const normalized = String(query || "").trim();
+    const normalized = I.methods.trim(I.StringCtor(query || ""));
     if (normalized.length < 3) throw new Error("请至少输入 3 个字符。");
     const cacheKey = "open-meteo:" + normalized.toLocaleLowerCase("en-US") + ":" +
-      String(settings.language || "zh-CN").toLocaleLowerCase("en-US");
+      I.StringCtor(settings.language || "zh-CN").toLocaleLowerCase("en-US");
     let network = readNetworkState();
     const cached = network.cityCache && network.cityCache[cacheKey];
-    if (cached && Date.now() - cached.cachedAt < 7 * 24 * 60 * 60 * 1000) {
+    if (cached && I.dateNow() - cached.cachedAt < 7 * 24 * 60 * 60 * 1000) {
       return { results: cached.results, cached: true };
     }
-    const sinceLast = Date.now() - finiteNumber(network.geocoderAt, 0);
+    const sinceLast = I.dateNow() - finiteNumber(network.geocoderAt, 0);
     if (sinceLast < 1100) await wait(1100 - sinceLast);
     network = readNetworkState();
-    network.geocoderAt = Date.now();
+    network.geocoderAt = I.dateNow();
     saveNetworkState(network);
     const parameters = new URLSearchParams({
       name: normalized,
       count: "10",
-      language: String(settings.language || "zh-CN").split("-")[0].toLowerCase(),
+      language: I.methods.toLowerCase(I.methods.split(I.StringCtor(settings.language || "zh-CN"), "-")[0]),
       format: "json",
     });
     const data = await requestJson(
       "https://geocoding-api.open-meteo.com/v1/search?" + parameters,
       { timeout: 8000 }
     );
-    if (!data || !Array.isArray(data.results)) {
+    if (!data || !I.Array.isArray(data.results)) {
       if (data && data.results == null) return { results: [], cached: false };
       throw new Error("城市搜索返回格式无效。");
     }
-    const results = data.results.map((item) => {
-      const latitude = Number(item.latitude);
-      const longitude = Number(item.longitude);
-      const city = String(item.name || "");
-      const country = String(item.country || item.country_code || "");
-      const area = String(item.admin1 || "");
-      const name = [city, area, country].filter((value, index, values) =>
-        value && values.indexOf(value) === index
-      ).join(", ");
+    const results = I.methods.slice(I.methods.filter(I.methods.map(data.results, (item) => {
+      const latitude = I.NumberCtor(item.latitude);
+      const longitude = I.NumberCtor(item.longitude);
+      const city = I.StringCtor(item.name || "");
+      const country = I.StringCtor(item.country || item.country_code || "");
+      const area = I.StringCtor(item.admin1 || "");
+      const name = I.methods.join(I.methods.filter([city, area, country], (value, index, values) =>
+        value && I.methods.indexOf(values, value) === index), ", ");
       return {
         name: name || city || country,
         city,
@@ -695,12 +878,11 @@
         longitude,
         timezone: canonicalTimezone(item.timezone, ""),
       };
-    }).filter((item) => validCoordinates(item.latitude, item.longitude))
-      .slice(0, 5);
+    }), (item) => validCoordinates(item.latitude, item.longitude)), 0, 5);
     network = readNetworkState();
     network.cityCache = trimCache({
       ...(network.cityCache || {}),
-      [cacheKey]: { results, cachedAt: Date.now() },
+      [cacheKey]: { results, cachedAt: I.dateNow() },
     }, 40);
     saveNetworkState(network);
     return { results, cached: false };
@@ -709,15 +891,15 @@
   async function resolveTimezone(latitude, longitude, hint) {
     const hinted = canonicalTimezone(hint, "");
     if (hinted) return { timezone: hinted, source: "IP 服务" };
-    const key = Number(latitude).toFixed(4) + "," + Number(longitude).toFixed(4);
+    const key = I.methods.toFixed(I.NumberCtor(latitude), 4) + "," + I.methods.toFixed(I.NumberCtor(longitude), 4);
     let network = readNetworkState();
     const cached = network.timezoneCache && network.timezoneCache[key];
-    if (cached && Date.now() - cached.cachedAt < 30 * 24 * 60 * 60 * 1000) {
+    if (cached && I.dateNow() - cached.cachedAt < 30 * 24 * 60 * 60 * 1000) {
       return { timezone: cached.timezone, source: "缓存" };
     }
     const parameters = new URLSearchParams({
-      latitude: String(latitude),
-      longitude: String(longitude),
+      latitude: I.StringCtor(latitude),
+      longitude: I.StringCtor(longitude),
     });
     const data = await requestJson(
       "https://timeapi.io/api/timezone/coordinate?" + parameters,
@@ -728,56 +910,57 @@
     network = readNetworkState();
     network.timezoneCache = trimCache({
       ...(network.timezoneCache || {}),
-      [key]: { timezone, cachedAt: Date.now() },
+      [key]: { timezone, cachedAt: I.dateNow() },
     }, 100);
     saveNetworkState(network);
     return { timezone, source: "TimeAPI.io" };
   }
 
   function isValidIpAddress(value) {
-    const ip = String(value || "").trim();
-    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
-    if (ipv4) return ipv4.slice(1).every((part) => Number(part) <= 255);
-    return /^([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}$/i.test(ip);
+    const ip = I.methods.trim(I.StringCtor(value || ""));
+    const ipv4 = I.methods.exec(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/, ip);
+    if (ipv4) return I.methods.every(I.methods.slice(ipv4, 1), (part) => I.NumberCtor(part) <= 255);
+    return I.methods.test(/^([0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}$/i, ip);
   }
 
   const IP_PROVIDERS = [
-    { name: "ipify", url: "https://api64.ipify.org/", parse: (body) => body.trim() },
-    { name: "ident.me", url: "https://ident.me/", parse: (body) => body.trim() },
-    { name: "ifconfig.me", url: "https://ifconfig.me/ip", parse: (body) => body.trim() },
-    { name: "icanhazip", url: "https://icanhazip.com/", parse: (body) => body.trim() },
+    { name: "ipify", url: "https://api64.ipify.org/", parse: (body) => I.methods.trim(body) },
+    { name: "ident.me", url: "https://ident.me/", parse: (body) => I.methods.trim(body) },
+    { name: "ifconfig.me", url: "https://ifconfig.me/ip", parse: (body) => I.methods.trim(body) },
+    { name: "icanhazip", url: "https://icanhazip.com/", parse: (body) => I.methods.trim(body) },
   ];
 
   async function detectPublicIp() {
     const failures = [];
-    for (const provider of IP_PROVIDERS) {
+    for (let _index2 = 0, _items2 = I.list(IP_PROVIDERS); _index2 < _items2.length; _index2++) {
+      const provider = _items2[_index2];
       try {
         const body = await requestText(provider.url, { timeout: 8000 });
         const ip = provider.parse(body);
         if (!isValidIpAddress(ip)) throw new Error("无效 IP");
         return { ip, provider: provider.name };
       } catch (error) {
-        failures.push(provider.name + ": " + (error && error.message || error));
+        I.methods.push(failures, provider.name + ": " + (error && error.message || error));
       }
     }
-    throw new Error("公网 IP 查询失败（" + failures.join("；") + "）");
+    throw new Error("公网 IP 查询失败（" + I.methods.join(failures, "；") + "）");
   }
 
   function normalizeIpGeo(data) {
     if (!data || typeof data !== "object") return null;
-    const latitude = Number(data.latitude);
-    const longitude = Number(data.longitude);
-    const ip = String(data.ip || data.ipAddress || "").trim();
+    const latitude = I.NumberCtor(data.latitude);
+    const longitude = I.NumberCtor(data.longitude);
+    const ip = I.methods.trim(I.StringCtor(data.ip || data.ipAddress || ""));
     if (!validCoordinates(latitude, longitude) || !isValidIpAddress(ip)) return null;
-    const rawZones = Array.isArray(data.timeZones) && data.timeZones.length === 1
+    const rawZones = I.Array.isArray(data.timeZones) && data.timeZones.length === 1
       ? data.timeZones[0]
       : data.timezone || data.time_zone || data.timeZone;
     return {
       latitude,
       longitude,
       ip,
-      city: String(data.city || data.cityName || ""),
-      country: String(data.country || data.countryName || data.country_name || data.countryCode || ""),
+      city: I.StringCtor(data.city || data.cityName || ""),
+      country: I.StringCtor(data.country || data.countryName || data.country_name || data.countryCode || ""),
       timezone: canonicalTimezone(rawZones, ""),
     };
   }
@@ -785,7 +968,7 @@
   async function geolocateIp(ip) {
     let network = readNetworkState();
     const cached = network.ipGeoCache && network.ipGeoCache[ip];
-    if (cached && Date.now() - cached.cachedAt < 30 * 24 * 60 * 60 * 1000) {
+    if (cached && I.dateNow() - cached.cachedAt < 30 * 24 * 60 * 60 * 1000) {
       return { ...cached.result, provider: "缓存" };
     }
     const services = [
@@ -808,35 +991,36 @@
         name: "ipinfo",
         url: "https://ipinfo.io/" + encodeURIComponent(ip) + "/json",
         transform(data) {
-          const parts = String(data && data.loc || "").split(",");
+          const parts = I.methods.split(I.StringCtor(data && data.loc || ""), ",");
           return normalizeIpGeo({
             ...data,
-            latitude: Number(parts[0]),
-            longitude: Number(parts[1]),
+            latitude: I.NumberCtor(parts[0]),
+            longitude: I.NumberCtor(parts[1]),
             country: data && data.country,
           });
         },
       },
     ];
     const failures = [];
-    for (const service of services) {
+    for (let _index3 = 0, _items3 = I.list(services); _index3 < _items3.length; _index3++) {
+      const service = _items3[_index3];
       try {
         const data = await requestJson(service.url, { timeout: 7000 });
         const result = service.transform(data);
         if (!result) throw new Error("响应字段无效");
-        if (result.ip !== ip && ip.includes(".")) throw new Error("响应 IP 不一致");
+        if (result.ip !== ip && I.methods.includes(ip, ".")) throw new Error("响应 IP 不一致");
         network = readNetworkState();
         network.ipGeoCache = trimCache({
           ...(network.ipGeoCache || {}),
-          [ip]: { result, cachedAt: Date.now() },
+          [ip]: { result, cachedAt: I.dateNow() },
         }, 50);
         saveNetworkState(network);
         return { ...result, provider: service.name };
       } catch (error) {
-        failures.push(service.name + ": " + (error && error.message || error));
+        I.methods.push(failures, service.name + ": " + (error && error.message || error));
       }
     }
-    throw new Error("IP 地理位置解析失败（" + failures.join("；") + "）");
+    throw new Error("IP 地理位置解析失败（" + I.methods.join(failures, "；") + "）");
   }
 
   async function getVpnLocation() {
@@ -858,9 +1042,9 @@
     saveSettings(next);
     const network = readNetworkState();
     network.lastIp = result.ip;
-    network.lastIpCheckAt = Date.now();
-    network.lastSyncAt = Date.now();
-    network.lastSyncLabel = [result.city, result.country].filter(Boolean).join(", ") || result.ip;
+    network.lastIpCheckAt = I.dateNow();
+    network.lastSyncAt = I.dateNow();
+    network.lastSyncLabel = I.methods.join(I.methods.filter([result.city, result.country], I.BooleanCtor), ", ") || result.ip;
     network.lastError = "";
     saveNetworkState(network);
     return next;
@@ -872,12 +1056,12 @@
     settings = current;
     if (!current.vpnAutoSync || autoSyncInFlight) return;
     const network = readNetworkState();
-    if (Date.now() - finiteNumber(network.lastIpCheckAt, 0) < 10000) return;
+    if (I.dateNow() - finiteNumber(network.lastIpCheckAt, 0) < 10000) return;
     autoSyncInFlight = (async () => {
       try {
         const first = await detectPublicIp();
         let state = readNetworkState();
-        state.lastIpCheckAt = Date.now();
+        state.lastIpCheckAt = I.dateNow();
         saveNetworkState(state);
         if (state.lastIp && state.lastIp === first.ip) return;
         await wait(2500);
@@ -888,8 +1072,8 @@
         log("VPN auto-sync applied", { reason, ip: confirmed.ip });
       } catch (error) {
         const state = readNetworkState();
-        state.lastError = String(error && error.message || error).slice(0, 500);
-        state.lastIpCheckAt = Date.now();
+        state.lastError = I.methods.slice(I.StringCtor(error && error.message || error), 0, 500);
+        state.lastIpCheckAt = I.dateNow();
         saveNetworkState(state);
         log("VPN auto-sync failed", error);
       }
@@ -902,7 +1086,7 @@
   function installAutoVpnSync() {
     if (!settings.vpnAutoSync) return;
     setTimeout(() => runAutoVpnCheck("page-open"), 1500);
-    const interval = Math.max(5, settings.vpnCheckMinutes) * 60 * 1000;
+    const interval = I.Math.max(5, settings.vpnCheckMinutes) * 60 * 1000;
     setInterval(() => runAutoVpnCheck("interval"), interval);
     addEventListener("online", () => runAutoVpnCheck("online"));
     document.addEventListener("visibilitychange", () => {
@@ -912,17 +1096,17 @@
   }
 
   function registerOverride(fn, nativeName) {
-    overrideRegistry.set(fn, nativeName);
+    I.WeakMapset(overrideRegistry, fn, nativeName);
   }
 
   function callOriginalToString(fn) {
-    return Reflect.apply(originals.functionToString, fn, []);
+    return I.Reflect.apply(originals.functionToString, fn, []);
   }
 
   function isConstructible(fn) {
     if (typeof fn !== "function") return false;
     try {
-      Reflect.construct(new Proxy(fn, { construct: () => ({}) }), []);
+      I.Reflect.construct(new I.Proxy(fn, { construct: () => ({}) }), []);
       return true;
     } catch (_) {
       return false;
@@ -931,16 +1115,16 @@
 
   function stripConstruct(fn) {
     const wrapper = {
-      method() {
-        const args = Array.prototype.slice.call(arguments);
+      method(...args) {
+
         try {
-          return Reflect.apply(fn, this, args);
+          return I.Reflect.apply(fn, this, args);
         } catch (error) {
           // Only errors produced by native argument validation are rewritten.
           // Page-thrown values (including option getters) retain their identity
           // and original stack. V8's boundary also works for anonymous Via evals.
-          if (nativeGeoErrors.has(error) && captureStackTrace) {
-            nativeGeoErrors.delete(error);
+          if (I.WeakSethas(nativeGeoErrors, error) && captureStackTrace) {
+            I.WeakSetdelete(nativeGeoErrors, error);
             try { captureStackTrace(error, wrapper); } catch (_) {}
           }
           throw error;
@@ -951,25 +1135,25 @@
   }
 
   function disguiseAsNative(fn, nativeName, expectedLength) {
-    Object.defineProperty(fn, "length", {
+    I.Object.defineProperty(fn, "length", {
       value: expectedLength,
       configurable: true,
       enumerable: false,
       writable: false,
     });
-    Object.defineProperty(fn, "name", {
+    I.Object.defineProperty(fn, "name", {
       value: nativeName,
       configurable: true,
       enumerable: false,
       writable: false,
     });
-    const prototypeDescriptor = Object.getOwnPropertyDescriptor(fn, "prototype");
+    const prototypeDescriptor = I.Object.getOwnPropertyDescriptor(fn, "prototype");
     if (prototypeDescriptor && prototypeDescriptor.configurable) delete fn.prototype;
   }
 
   function installOverride(target, property, implementation, forcedLength) {
     if (!target) return null;
-    const descriptor = Object.getOwnPropertyDescriptor(target, property);
+    const descriptor = I.Object.getOwnPropertyDescriptor(target, property);
     const original = descriptor && descriptor.value;
     const expectedLength =
       forcedLength == null && typeof original === "function"
@@ -979,14 +1163,14 @@
           : forcedLength;
     let finalFunction = implementation;
     if (
-      Object.prototype.hasOwnProperty.call(implementation, "prototype") &&
+      I.hasOwn(implementation, "prototype") &&
       !isConstructible(original)
     ) {
       finalFunction = stripConstruct(implementation);
     }
     registerOverride(finalFunction, property);
     disguiseAsNative(finalFunction, property, expectedLength);
-    Object.defineProperty(target, property, {
+    I.Object.defineProperty(target, property, {
       value: finalFunction,
       configurable: descriptor ? descriptor.configurable : true,
       enumerable: descriptor ? descriptor.enumerable : false,
@@ -997,8 +1181,8 @@
 
   function accessorMaskName(kind, property) {
     try {
-      const nativeGetter = Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
-      return callOriginalToString(nativeGetter).includes("get size")
+      const nativeGetter = I.Object.getOwnPropertyDescriptor(Map.prototype, "size").get;
+      return I.methods.includes(callOriginalToString(nativeGetter), "get size")
         ? `${kind} ${property}`
         : property;
     } catch (_) {
@@ -1007,7 +1191,7 @@
   }
 
   function installAccessor(target, property, accessors) {
-    const original = Object.getOwnPropertyDescriptor(target, property);
+    const original = I.Object.getOwnPropertyDescriptor(target, property);
     if (!original) return false;
     const descriptor = {
       configurable: original.configurable,
@@ -1029,15 +1213,15 @@
     } else if (original.set) {
       descriptor.set = original.set;
     }
-    Object.defineProperty(target, property, descriptor);
+    I.Object.defineProperty(target, property, descriptor);
     return true;
   }
 
   function installFunctionMaskingOn(realm) {
     const functionPrototype = realm.Function.prototype;
     const nativeToString = functionPrototype.toString;
-    const numberSource = Reflect.apply(nativeToString, realm.Number, []);
-    const split = numberSource.split("Number");
+    const numberSource = I.Reflect.apply(nativeToString, realm.Number, []);
+    const split = I.methods.split(numberSource, "Number");
     const nativePrefix = split[0] || "function ";
     const nativeSuffix = split[1] || "() { [native code] }";
     const maskedToString = createMaskedToString(nativeToString, nativePrefix, nativeSuffix);
@@ -1050,15 +1234,15 @@
     const key = seed + "|" + salt + "|" + latitude + "|" + longitude;
     let hash = 1779033703 ^ key.length;
     for (let index = 0; index < key.length; index += 1) {
-      hash = Math.imul(hash ^ key.charCodeAt(index), 3432918353);
+      hash = I.Math.imul(hash ^ I.methods.charCodeAt(key, index), 3432918353);
       hash = (hash << 13) | (hash >>> 19);
     }
-    hash = Math.imul(hash ^ (hash >>> 16), 2246822507);
-    hash = Math.imul(hash ^ (hash >>> 13), 3266489909);
+    hash = I.Math.imul(hash ^ (hash >>> 16), 2246822507);
+    hash = I.Math.imul(hash ^ (hash >>> 13), 3266489909);
     hash ^= hash >>> 16;
     let mixed = (hash + 0x6d2b79f5) | 0;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    mixed = I.Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + I.Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
     return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   }
 
@@ -1068,27 +1252,27 @@
   }
 
   function resolveReportedCoordinates(latitude, longitude, enabled, radius, seed) {
-    const anchorLatitude = Math.max(-90, Math.min(90, finiteNumber(latitude, 0)));
+    const anchorLatitude = I.Math.max(-90, I.Math.min(90, finiteNumber(latitude, 0)));
     const anchorLongitude = wrapLongitude(finiteNumber(longitude, 0));
     if (!enabled) {
       return { latitude: anchorLatitude, longitude: anchorLongitude };
     }
-    const safeRadius = Math.max(50, Math.min(50000, finiteNumber(radius, 500)));
-    const distance = safeRadius * Math.sqrt(
+    const safeRadius = I.Math.max(50, I.Math.min(50000, finiteNumber(radius, 500)));
+    const distance = safeRadius * I.Math.sqrt(
       coordinateHash01(seed, anchorLatitude, anchorLongitude, 0x9e3779b9)
     );
-    const bearing = 2 * Math.PI *
+    const bearing = 2 * I.Math.PI *
       coordinateHash01(seed, anchorLatitude, anchorLongitude, 0x85ebca6b);
     const earthRadius = 6371000;
-    const north = distance * Math.cos(bearing);
-    const east = distance * Math.sin(bearing);
-    const latitudeOffset = north / earthRadius * 180 / Math.PI;
-    const cosine = Math.cos(anchorLatitude * Math.PI / 180);
-    const longitudeOffset = Math.abs(cosine) < 1e-12
+    const north = distance * I.Math.cos(bearing);
+    const east = distance * I.Math.sin(bearing);
+    const latitudeOffset = north / earthRadius * 180 / I.Math.PI;
+    const cosine = I.Math.cos(anchorLatitude * I.Math.PI / 180);
+    const longitudeOffset = I.Math.abs(cosine) < 1e-12
       ? 0
-      : east / (earthRadius * cosine) * 180 / Math.PI;
+      : east / (earthRadius * cosine) * 180 / I.Math.PI;
     return {
-      latitude: Math.max(-90, Math.min(90, anchorLatitude + latitudeOffset)),
+      latitude: I.Math.max(-90, I.Math.min(90, anchorLatitude + latitudeOffset)),
       longitude: wrapLongitude(anchorLongitude + longitudeOffset),
     };
   }
@@ -1096,16 +1280,17 @@
   const GEOHASH_ALPHABET = "0123456789bcdefghjkmnpqrstuvwxyz";
 
   function decodeGeohash(value) {
-    const geohash = String(value || "").trim().toLowerCase();
-    if (!/^[0123456789bcdefghjkmnpqrstuvwxyz]{5,12}$/.test(geohash) ||
-        !/[b-z]/.test(geohash)) return null;
+    const geohash = I.methods.toLowerCase(I.methods.trim(I.StringCtor(value || "")));
+    if (!I.methods.test(/^[0123456789bcdefghjkmnpqrstuvwxyz]{5,12}$/, geohash) ||
+        !I.methods.test(/[b-z]/, geohash)) return null;
     let latitudeMin = -90;
     let latitudeMax = 90;
     let longitudeMin = -180;
     let longitudeMax = 180;
     let longitudeBit = true;
-    for (const character of geohash) {
-      const number = GEOHASH_ALPHABET.indexOf(character);
+    for (let _index4 = 0, _items4 = I.list(geohash); _index4 < _items4.length; _index4++) {
+      const character = _items4[_index4];
+      const number = I.methods.indexOf(GEOHASH_ALPHABET, character);
       if (number < 0) return null;
       for (let mask = 16; mask > 0; mask >>= 1) {
         if (longitudeBit) {
@@ -1127,79 +1312,80 @@
   }
 
   function parseCoordinateAngle(value) {
-    const source = String(value || "").trim();
+    const source = I.methods.trim(I.StringCtor(value || ""));
     if (!source) return null;
-    const hemisphereMatches = source.match(/[NSEW]/gi);
+    const hemisphereMatches = I.methods.match(source, /[NSEW]/gi);
     if (hemisphereMatches && hemisphereMatches.length > 1) return null;
-    const hemisphere = hemisphereMatches ? hemisphereMatches[0].toUpperCase() : "";
-    const axis = /[NS]/.test(hemisphere) ? "latitude" : /[EW]/.test(hemisphere)
+    const hemisphere = hemisphereMatches ? I.methods.toUpperCase(hemisphereMatches[0]) : "";
+    const axis = I.methods.test(/[NS]/, hemisphere) ? "latitude" : I.methods.test(/[EW]/, hemisphere)
       ? "longitude" : null;
-    const numbers = source.replace(/[NSEW]/gi, " ").match(/[+-]?\d+(?:\.\d+)?/g);
+    const numbers = I.methods.match(I.methods.replace(source, /[NSEW]/gi, " "), /[+-]?\d+(?:\.\d+)?/g);
     if (!numbers || numbers.length < 1 || numbers.length > 3) return null;
-    const degrees = Number(numbers[0]);
-    const minutes = numbers.length > 1 ? Number(numbers[1]) : 0;
-    const seconds = numbers.length > 2 ? Number(numbers[2]) : 0;
-    if (![degrees, minutes, seconds].every(Number.isFinite) ||
+    const degrees = I.NumberCtor(numbers[0]);
+    const minutes = numbers.length > 1 ? I.NumberCtor(numbers[1]) : 0;
+    const seconds = numbers.length > 2 ? I.NumberCtor(numbers[2]) : 0;
+    if (!I.methods.every([degrees, minutes, seconds], I.Number.isFinite) ||
         minutes < 0 || minutes >= 60 || seconds < 0 || seconds >= 60) return null;
-    const magnitude = Math.abs(degrees) + minutes / 60 + seconds / 3600;
+    const magnitude = I.Math.abs(degrees) + minutes / 60 + seconds / 3600;
     const negative = hemisphere === "S" || hemisphere === "W" ||
-      (!hemisphere && (degrees < 0 || Object.is(degrees, -0)));
+      (!hemisphere && (degrees < 0 || I.Object.is(degrees, -0)));
     return { value: negative ? -magnitude : magnitude, axis };
   }
 
   function splitCoordinatePair(value) {
-    const source = String(value || "").trim();
-    const comma = source.indexOf(",");
-    if (comma >= 0 && source.indexOf(",", comma + 1) < 0) {
-      return [source.slice(0, comma), source.slice(comma + 1)];
+    const source = I.methods.trim(I.StringCtor(value || ""));
+    const comma = I.methods.indexOf(source, ",");
+    if (comma >= 0 && I.methods.indexOf(source, ",", comma + 1) < 0) {
+      return [I.methods.slice(source, 0, comma), I.methods.slice(source, comma + 1)];
     }
-    const hemispheres = Array.from(source.matchAll(/[NSEW]/gi));
+    const hemispheres = I.Array.from(I.methods.matchAll(source, /[NSEW]/gi));
     if (hemispheres.length === 2) {
       const firstIndex = hemispheres[0].index || 0;
-      if (/\d/.test(source.slice(0, firstIndex))) {
-        return [source.slice(0, firstIndex + 1), source.slice(firstIndex + 1)];
+      if (I.methods.test(/\d/, I.methods.slice(source, 0, firstIndex))) {
+        return [I.methods.slice(source, 0, firstIndex + 1), I.methods.slice(source, firstIndex + 1)];
       }
       const secondIndex = hemispheres[1].index || 0;
-      return [source.slice(0, secondIndex), source.slice(secondIndex)];
+      return [I.methods.slice(source, 0, secondIndex), I.methods.slice(source, secondIndex)];
     }
-    const parts = source.split(/[\s/|;]+/).filter(Boolean);
+    const parts = I.methods.filter(I.methods.split(source, /[\s/|;]+/), I.BooleanCtor);
     return parts.length === 2 ? parts : null;
   }
 
   function validCoordinatePair(latitude, longitude) {
-    return Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 &&
-      Number.isFinite(longitude) && longitude >= -180 && longitude <= 180
+    return I.Number.isFinite(latitude) && latitude >= -90 && latitude <= 90 &&
+      I.Number.isFinite(longitude) && longitude >= -180 && longitude <= 180
       ? { latitude, longitude }
       : null;
   }
 
   function parseCoordinateText(value) {
-    const source = typeof value === "string" ? value.replace(/\u2212/g, "-").trim() : "";
+    const source = typeof value === "string" ? I.methods.trim(I.methods.replace(value, /\u2212/g, "-")) : "";
     if (!source) return null;
 
-    const mapAt = /@([+-]?\d+(?:\.\d+)?),([+-]?\d+(?:\.\d+)?)/.exec(source);
-    if (mapAt) return validCoordinatePair(Number(mapAt[1]), Number(mapAt[2]));
-    if (/^https?:\/\//i.test(source)) {
+    const mapAt = I.methods.exec(/@([+-]?\d+(?:\.\d+)?),([+-]?\d+(?:\.\d+)?)/, source);
+    if (mapAt) return validCoordinatePair(I.NumberCtor(mapAt[1]), I.NumberCtor(mapAt[2]));
+    if (I.methods.test(/^https?:\/\//i, source)) {
       try {
         const url = new URL(source);
-        for (const name of ["q", "query", "ll", "center", "destination"]) {
+        for (let _index5 = 0, _items5 = I.list(["q", "query", "ll", "center", "destination"]); _index5 < _items5.length; _index5++) {
+          const name = _items5[_index5];
           const candidate = url.searchParams.get(name);
-          const match = candidate && /^\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*$/.exec(candidate);
-          if (match) return validCoordinatePair(Number(match[1]), Number(match[2]));
+          const match = candidate && I.methods.exec(/^\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*$/, candidate);
+          if (match) return validCoordinatePair(I.NumberCtor(match[1]), I.NumberCtor(match[2]));
         }
       } catch (_) {
         return null;
       }
     }
 
-    const latitudeLabel = /lat(?:itude)?[^a-z\d+-]*([+-]?\d+(?:\.\d+)?)/i.exec(source);
-    const longitudeLabel = /(?:lon(?:gitude|g)?|lng)[^a-z\d+-]*([+-]?\d+(?:\.\d+)?)/i.exec(source);
+    const latitudeLabel = I.methods.exec(/lat(?:itude)?[^a-z\d+-]*([+-]?\d+(?:\.\d+)?)/i, source);
+    const longitudeLabel = I.methods.exec(/(?:lon(?:gitude|g)?|lng)[^a-z\d+-]*([+-]?\d+(?:\.\d+)?)/i, source);
     if (latitudeLabel && longitudeLabel) {
-      return validCoordinatePair(Number(latitudeLabel[1]), Number(longitudeLabel[1]));
+      return validCoordinatePair(I.NumberCtor(latitudeLabel[1]), I.NumberCtor(longitudeLabel[1]));
     }
 
-    const letters = source.replace(/[^a-z]/gi, "");
-    if (!letters || /^[NSEW]+$/i.test(letters)) {
+    const letters = I.methods.replace(source, /[^a-z]/gi, "");
+    if (!letters || I.methods.test(/^[NSEW]+$/i, letters)) {
       const pair = splitCoordinatePair(source);
       if (pair) {
         const first = parseCoordinateAngle(pair[0]);
@@ -1223,15 +1409,15 @@
   }
 
   function decimalPlaces(number) {
-    const value = String(number);
-    if (value.includes("e") || value.includes("E")) return 0;
-    const dot = value.indexOf(".");
+    const value = I.StringCtor(number);
+    if (I.methods.includes(value, "e") || I.methods.includes(value, "E")) return 0;
+    const dot = I.methods.indexOf(value, ".");
     return dot === -1 ? 0 : value.length - dot - 1;
   }
 
   function padCoordinate(raw) {
     if (decimalPlaces(raw) >= 7) return raw;
-    return Math.round((raw + (randomUnit() - 0.5) * 1e-7) * 1e8) / 1e8;
+    return I.Math.round((raw + (randomUnit() - 0.5) * 1e-7) * 1e8) / 1e8;
   }
 
   function getPaddedCoordinates() {
@@ -1271,15 +1457,16 @@
         "heading",
         "speed",
       ];
-      for (const key of keys) {
-        const descriptor = Object.getOwnPropertyDescriptor(Coordinates.prototype, key);
+      for (let _index6 = 0, _items6 = I.list(keys); _index6 < _items6.length; _index6++) {
+        const key = _items6[_index6];
+        const descriptor = I.Object.getOwnPropertyDescriptor(Coordinates.prototype, key);
         if (!descriptor || typeof descriptor.get !== "function") continue;
         const nativeGetter = descriptor.get;
         installAccessor(Coordinates.prototype, key, {
           get: function geolocationCoordinateGetter() {
-            const slots = coordsSlots.get(this);
+            const slots = I.WeakMapget(coordsSlots, this);
             if (slots) return slots[key];
-            return Reflect.apply(nativeGetter, this, []);
+            return I.Reflect.apply(nativeGetter, this, []);
           },
         });
       }
@@ -1288,7 +1475,7 @@
         Coordinates.prototype,
         "toJSON",
         function geolocationCoordinatesToJSON() {
-          const slots = coordsSlots.get(this);
+          const slots = I.WeakMapget(coordsSlots, this);
           if (slots) {
             return {
               accuracy: slots.accuracy,
@@ -1300,7 +1487,7 @@
               speed: slots.speed,
             };
           }
-          if (typeof nativeToJSON === "function") return Reflect.apply(nativeToJSON, this, []);
+          if (typeof nativeToJSON === "function") return I.Reflect.apply(nativeToJSON, this, []);
           return {};
         },
         0
@@ -1308,15 +1495,16 @@
     }
 
     if (Position && Position.prototype) {
-      for (const key of ["coords", "timestamp"]) {
-        const descriptor = Object.getOwnPropertyDescriptor(Position.prototype, key);
+      for (let _index7 = 0, _items7 = I.list(["coords", "timestamp"]); _index7 < _items7.length; _index7++) {
+        const key = _items7[_index7];
+        const descriptor = I.Object.getOwnPropertyDescriptor(Position.prototype, key);
         if (!descriptor || typeof descriptor.get !== "function") continue;
         const nativeGetter = descriptor.get;
         installAccessor(Position.prototype, key, {
           get: function geolocationPositionGetter() {
-            const slots = positionSlots.get(this);
+            const slots = I.WeakMapget(positionSlots, this);
             if (slots) return slots[key];
-            return Reflect.apply(nativeGetter, this, []);
+            return I.Reflect.apply(nativeGetter, this, []);
           },
         });
       }
@@ -1325,9 +1513,9 @@
         Position.prototype,
         "toJSON",
         function geolocationPositionToJSON() {
-          const slots = positionSlots.get(this);
+          const slots = I.WeakMapget(positionSlots, this);
           if (slots) {
-            const coords = coordsSlots.get(slots.coords);
+            const coords = I.WeakMapget(coordsSlots, slots.coords);
             return {
               timestamp: slots.timestamp,
               coords: coords
@@ -1343,7 +1531,7 @@
                 : slots.coords,
             };
           }
-          if (typeof nativeToJSON === "function") return Reflect.apply(nativeToJSON, this, []);
+          if (typeof nativeToJSON === "function") return I.Reflect.apply(nativeToJSON, this, []);
           return {};
         },
         0
@@ -1364,65 +1552,65 @@
     };
     let coords;
     if (realm.GeolocationCoordinates && realm.GeolocationCoordinates.prototype) {
-      coords = Object.create(realm.GeolocationCoordinates.prototype);
-      coordsSlots.set(coords, values);
+      coords = I.Object.create(realm.GeolocationCoordinates.prototype);
+      I.WeakMapset(coordsSlots, coords, values);
     } else {
-      coords = Object.freeze({ ...values });
+      coords = I.Object.freeze({ ...values });
     }
-    const timestamp = Date.now();
+    const timestamp = I.dateNow();
     if (realm.GeolocationPosition && realm.GeolocationPosition.prototype) {
-      const position = Object.create(realm.GeolocationPosition.prototype);
-      positionSlots.set(position, { coords, timestamp });
+      const position = I.Object.create(realm.GeolocationPosition.prototype);
+      I.WeakMapset(positionSlots, position, { coords, timestamp });
       return position;
     }
-    return Object.freeze({ coords, timestamp });
+    return I.Object.freeze({ coords, timestamp });
   }
 
   function validGeoArguments(realm, receiver, success, error, options) {
     if (realm.Geolocation && !(receiver instanceof realm.Geolocation)) return false;
     if (typeof success !== "function") return false;
     if (error != null && typeof error !== "function") return false;
-    if (options != null && Object(options) !== options) return false;
+    if (options != null && I.ObjectCtor(options) !== options) return false;
     return true;
   }
 
   function reproduceNativeError(nativeMethod, receiver, args) {
-    const forwarded = Array.prototype.slice.call(args);
+    const forwarded = I.list(args);
     if (typeof forwarded[0] === "function") forwarded[0] = function noop() {};
     if (typeof forwarded[1] === "function") forwarded[1] = function noop() {};
     try {
-      return Reflect.apply(nativeMethod, receiver, forwarded);
+      return I.Reflect.apply(nativeMethod, receiver, forwarded);
     } catch (error) {
-      if (error && typeof error === "object") nativeGeoErrors.add(error);
+      if (error && typeof error === "object") I.WeakSetadd(nativeGeoErrors, error);
       throw error;
     }
   }
 
   function deliver(callback, value, delay) {
-    const bound = callback.bind(undefined, value);
+    const bound = I.bind(callback, undefined, value);
     if (delay == null) queueMicrotask(bound);
     else setTimeout(bound, delay);
   }
 
   function buildGeolocationOverrides(realm, native) {
-    const syntheticWatches = new Map();
-    let nextWatchId = 1000000000 + Math.floor(randomUnit() * 100000000);
+    const syntheticWatches = I.newMap();
+    let nextWatchId = 1000000000 + I.Math.floor(randomUnit() * 100000000);
     let cached = null;
 
     function getCached(options) {
       const requestedAge = options == null ? undefined : options.maximumAge;
       const rawAge = requestedAge === undefined ? 0 : +requestedAge;
-      const clampedAge = Number.isNaN(rawAge) ? 0 : Math.min(0xffffffff, Math.max(0, rawAge));
-      const floorAge = Math.floor(clampedAge);
+      const clampedAge = I.Number.isNaN(rawAge) ? 0 : I.Math.min(0xffffffff, I.Math.max(0, rawAge));
+      const floorAge = I.Math.floor(clampedAge);
       const maximumAge = clampedAge - floorAge === 0.5
-        ? floorAge + (floorAge % 2) : Math.round(clampedAge);
+        ? floorAge + (floorAge % 2) : I.Math.round(clampedAge);
       if (!cached || maximumAge <= 0) return null;
-      return Date.now() - cached.createdAt <= maximumAge ? cached.position : null;
+      return I.dateNow() - cached.createdAt <= maximumAge ? cached.position : null;
     }
 
     function freshPosition() {
       const position = createPosition(realm);
-      cached = { position, createdAt: Date.now() };
+      cached = { position, createdAt: I.dateNow() };
       return position;
     }
 
@@ -1435,7 +1623,7 @@
         return reproduceNativeError(native.getCurrentPosition, this, arguments);
       }
       if (!protectionActive()) {
-        return Reflect.apply(native.getCurrentPosition, this, [success, error, options]);
+        return I.Reflect.apply(native.getCurrentPosition, this, [success, error, options]);
       }
       const cachedPosition = getCached(options);
       if (cachedPosition) {
@@ -1443,7 +1631,7 @@
         return undefined;
       }
       if (settings.preservePermissionPrompt) {
-        return Reflect.apply(native.getCurrentPosition, this, [
+        return I.Reflect.apply(native.getCurrentPosition, this, [
           function nativePromptGranted() {
             deliver(success, freshPosition());
           },
@@ -1461,10 +1649,10 @@
         return 0;
       }
       if (!protectionActive()) {
-        return Reflect.apply(native.watchPosition, this, [success, error, options]);
+        return I.Reflect.apply(native.watchPosition, this, [success, error, options]);
       }
       if (settings.preservePermissionPrompt) {
-        return Reflect.apply(native.watchPosition, this, [
+        return I.Reflect.apply(native.watchPosition, this, [
           function nativeWatchGranted() {
             if (protectionActive()) deliver(success, freshPosition());
           },
@@ -1475,7 +1663,7 @@
 
       const watchId = nextWatchId++;
       const record = { active: true, timer: 0 };
-      syntheticWatches.set(watchId, record);
+      I.Mapset(syntheticWatches, watchId, record);
 
       const emit = () => {
         if (!record.active || !protectionActive()) return;
@@ -1501,10 +1689,10 @@
       const stop = () => {
         record.active = false;
         clearTimeout(record.timer);
-        syntheticWatches.delete(watchId);
+        I.Mapdelete(syntheticWatches, watchId);
       };
       record.stop = stop;
-      syntheticWatchStops.add(stop);
+      I.Setadd(syntheticWatchStops, stop);
       return watchId;
     }
 
@@ -1512,49 +1700,51 @@
       if (!arguments.length || (realm.Geolocation && !(this instanceof realm.Geolocation))) {
         return reproduceNativeError(native.clearWatch, this, arguments);
       }
-      const record = syntheticWatches.get(Number(watchId));
+      const record = I.Mapget(syntheticWatches, I.NumberCtor(watchId));
       if (record) {
         record.stop();
-        syntheticWatchStops.delete(record.stop);
+        I.Setdelete(syntheticWatchStops, record.stop);
         return undefined;
       }
-      return Reflect.apply(native.clearWatch, this, [watchId]);
+      return I.Reflect.apply(native.clearWatch, this, [watchId]);
     }
 
     return { getCurrentPosition, watchPosition, clearWatch };
   }
 
   function stopAllSyntheticWatches() {
-    for (const stop of Array.from(syntheticWatchStops)) {
+    for (let _index8 = 0, _items8 = I.list(I.Array.from(syntheticWatchStops)); _index8 < _items8.length; _index8++) {
+      const stop = _items8[_index8];
       try {
         stop();
       } catch (_) {
         // No-op.
       }
     }
-    syntheticWatchStops.clear();
+    I.Setclear(syntheticWatchStops);
   }
 
-  const permissionSlots = new WeakMap();
+  const permissionSlots = I.newWeakMap();
 
   // Fake statuses are real EventTargets with the PermissionStatus prototype and
   // no own properties; the prototype accessors read their values from slots.
   function createPermissionStatus(realm) {
     const target = new realm.EventTarget();
-    if (realm.PermissionStatus) Object.setPrototypeOf(target, realm.PermissionStatus.prototype);
+    if (realm.PermissionStatus) I.Object.setPrototypeOf(target, realm.PermissionStatus.prototype);
     const slots = { state: "granted", name: "geolocation", onchange: null, listener: null };
     slots.listener = function (event) {
-      if (typeof slots.onchange === "function") Reflect.apply(slots.onchange, target, [event]);
+      if (typeof slots.onchange === "function") I.Reflect.apply(slots.onchange, target, [event]);
     };
-    permissionSlots.set(target, slots);
+    I.WeakMapset(permissionSlots, target, slots);
     const prototype = realm.PermissionStatus && realm.PermissionStatus.prototype;
-    for (const key of ["state", "name"]) {
-      if (!prototype || !Object.getOwnPropertyDescriptor(prototype, key)) {
-        Object.defineProperty(target, key, { value: slots[key], enumerable: true });
+    for (let _index9 = 0, _items9 = I.list(["state", "name"]); _index9 < _items9.length; _index9++) {
+      const key = _items9[_index9];
+      if (!prototype || !I.Object.getOwnPropertyDescriptor(prototype, key)) {
+        I.Object.defineProperty(target, key, { value: slots[key], enumerable: true });
       }
     }
-    if (!prototype || !Object.getOwnPropertyDescriptor(prototype, "onchange")) {
-      Object.defineProperty(target, "onchange", {
+    if (!prototype || !I.Object.getOwnPropertyDescriptor(prototype, "onchange")) {
+      I.Object.defineProperty(target, "onchange", {
         get: () => slots.onchange,
         set: (value) => setPermissionOnchange(target, slots, value),
         enumerable: true,
@@ -1574,21 +1764,22 @@
   function installPermissionStatusAccessors(realm) {
     const prototype = realm.PermissionStatus && realm.PermissionStatus.prototype;
     if (!prototype) return;
-    for (const key of ["state", "name", "onchange"]) {
-      const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+    for (let _index10 = 0, _items10 = I.list(["state", "name", "onchange"]); _index10 < _items10.length; _index10++) {
+      const key = _items10[_index10];
+      const descriptor = I.Object.getOwnPropertyDescriptor(prototype, key);
       if (!descriptor || typeof descriptor.get !== "function") continue;
       const nativeGet = descriptor.get;
       const nativeSet = descriptor.set;
       const accessors = {
         get: function permissionStatusGetter() {
-          const slots = permissionSlots.get(this);
-          return slots ? slots[key] : Reflect.apply(nativeGet, this, []);
+          const slots = I.WeakMapget(permissionSlots, this);
+          return slots ? slots[key] : I.Reflect.apply(nativeGet, this, []);
         },
       };
       if (key === "onchange" && typeof nativeSet === "function") {
         accessors.set = function permissionStatusSetter(value) {
-          const slots = permissionSlots.get(this);
-          if (!slots) return Reflect.apply(nativeSet, this, [value]);
+          const slots = I.WeakMapget(permissionSlots, this);
+          if (!slots) return I.Reflect.apply(nativeSet, this, [value]);
           setPermissionOnchange(this, slots, value);
           return undefined;
         };
@@ -1602,7 +1793,7 @@
     installPermissionStatusAccessors(realm);
     function permissionsQuery(descriptor) {
       if (!(this instanceof realm.Permissions)) {
-        return Reflect.apply(native.permissionsQuery, this, [descriptor]);
+        return I.Reflect.apply(native.permissionsQuery, this, [descriptor]);
       }
       if (
         protectionActive() &&
@@ -1612,20 +1803,21 @@
       ) {
         return Promise.resolve(createPermissionStatus(realm));
       }
-      return Reflect.apply(native.permissionsQuery, this, [descriptor]);
+      return I.Reflect.apply(native.permissionsQuery, this, [descriptor]);
     }
     installOverride(realm.Permissions.prototype, "query", permissionsQuery, 1);
   }
 
   function isDefaultLocaleRequest(locales) {
-    return locales === undefined || (Array.isArray(locales) && locales.length === 0);
+    return locales === undefined || (I.Array.isArray(locales) && locales.length === 0);
   }
 
   function copyConstructorStatics(Native, Wrapped) {
-    for (const key of Reflect.ownKeys(Native)) {
+    for (let _index11 = 0, _items11 = I.list(I.Reflect.ownKeys(Native)); _index11 < _items11.length; _index11++) {
+      const key = _items11[_index11];
       if (key === "name" || key === "length" || key === "prototype") continue;
       try {
-        Object.defineProperty(Wrapped, key, Object.getOwnPropertyDescriptor(Native, key));
+        I.Object.defineProperty(Wrapped, key, I.Object.getOwnPropertyDescriptor(Native, key));
       } catch (_) {
         // Some engines expose non-copyable implementation-specific properties.
       }
@@ -1640,27 +1832,27 @@
 
   function installConstructorOverride(container, property, Native, buildArguments) {
     if (!container || typeof Native !== "function") return null;
-    const descriptor = Object.getOwnPropertyDescriptor(container, property);
-    let Wrapped = function () {
-      const args = Array.prototype.slice.call(arguments);
+    const descriptor = I.Object.getOwnPropertyDescriptor(container, property);
+    let Wrapped = function (...args) {
+
       const finalArgs = buildArguments(args);
-      if (!new.target) return Reflect.apply(Native, this, finalArgs);
+      if (!new.target) return I.Reflect.apply(Native, this, finalArgs);
       const target = new.target && new.target !== Wrapped ? new.target : Native;
-      return Reflect.construct(Native, finalArgs, target);
+      return I.Reflect.construct(Native, finalArgs, target);
     };
     registerOverride(Wrapped, property);
     disguiseAsNative(Wrapped, property, Native.length);
     try {
-      Object.setPrototypeOf(Wrapped, Object.getPrototypeOf(Native));
+      I.Object.setPrototypeOf(Wrapped, I.Object.getPrototypeOf(Native));
       copyConstructorStatics(Native, Wrapped);
-      Object.defineProperty(Wrapped, "prototype", {
+      I.Object.defineProperty(Wrapped, "prototype", {
         value: Native.prototype,
         writable: false,
         enumerable: false,
         configurable: false,
       });
-      const constructorDescriptor = Object.getOwnPropertyDescriptor(Native.prototype, "constructor");
-      Object.defineProperty(Native.prototype, "constructor", {
+      const constructorDescriptor = I.Object.getOwnPropertyDescriptor(Native.prototype, "constructor");
+      I.Object.defineProperty(Native.prototype, "constructor", {
         value: Wrapped,
         writable: constructorDescriptor ? constructorDescriptor.writable : true,
         enumerable: constructorDescriptor ? constructorDescriptor.enumerable : false,
@@ -1669,7 +1861,7 @@
     } catch (_) {
       // The important behavior is the native instance returned by Reflect.construct.
     }
-    Object.defineProperty(container, property, {
+    I.Object.defineProperty(container, property, {
       value: Wrapped,
       configurable: descriptor ? descriptor.configurable : true,
       enumerable: descriptor ? descriptor.enumerable : false,
@@ -1681,32 +1873,32 @@
   function installNavigatorLocale(realm) {
     const NavigatorPrototype = realm.Navigator && realm.Navigator.prototype;
     if (!NavigatorPrototype) return;
-    const languageDescriptor = Object.getOwnPropertyDescriptor(NavigatorPrototype, "language");
+    const languageDescriptor = I.Object.getOwnPropertyDescriptor(NavigatorPrototype, "language");
     if (languageDescriptor && typeof languageDescriptor.get === "function") {
       const nativeGetLanguage = languageDescriptor.get;
       installAccessor(NavigatorPrototype, "language", {
         get: function navigatorLanguageGetter() {
-          const nativeValue = Reflect.apply(nativeGetLanguage, this, []);
+          const nativeValue = I.Reflect.apply(nativeGetLanguage, this, []);
           return protectionActive() && settings.localeEnabled ? settings.language : nativeValue;
         },
       });
     }
-    const languagesDescriptor = Object.getOwnPropertyDescriptor(NavigatorPrototype, "languages");
+    const languagesDescriptor = I.Object.getOwnPropertyDescriptor(NavigatorPrototype, "languages");
     if (languagesDescriptor && typeof languagesDescriptor.get === "function") {
       const nativeGetLanguages = languagesDescriptor.get;
       let languagesSource;
       let spoofedLanguages;
       installAccessor(NavigatorPrototype, "languages", {
         get: function navigatorLanguagesGetter() {
-          const nativeValue = Reflect.apply(nativeGetLanguages, this, []);
+          const nativeValue = I.Reflect.apply(nativeGetLanguages, this, []);
           if (!protectionActive() || !settings.localeEnabled) return nativeValue;
           // Settings reloads replace the array; keep the frozen copy (and its
           // identity) unless the languages actually changed.
           if (settings.languages !== languagesSource) {
             const next = settings.languages;
             const same = spoofedLanguages && spoofedLanguages.length === next.length &&
-              next.every((language, index) => spoofedLanguages[index] === language);
-            if (!same) spoofedLanguages = realm.Object.freeze(realm.Array.from(next));
+              I.methods.every(next, (language, index) => spoofedLanguages[index] === language);
+            if (!same) spoofedLanguages = I.Object.freeze(I.list(next));
             languagesSource = next;
           }
           return spoofedLanguages;
@@ -1721,20 +1913,20 @@
     installOverride(
       target,
       property,
-      function localeAwareMethod() {
-        const args = Array.prototype.slice.call(arguments);
+      function localeAwareMethod(...args) {
+
         if (protectionActive() && settings.localeEnabled && isDefaultLocaleRequest(args[localeIndex])) {
           args[localeIndex] = settings.languages;
         }
         if (injectTimezone && protectionActive() && settings.timezoneEnabled) {
           const rawOptions = args[optionsIndex];
           if (rawOptions == null || rawOptions.timeZone === undefined) {
-            args[optionsIndex] = Object.assign({}, rawOptions || {}, {
+            args[optionsIndex] = I.Object.assign({}, rawOptions || {}, {
               timeZone: settings.timezone,
             });
           }
         }
-        return Reflect.apply(nativeMethod, this, args);
+        return I.Reflect.apply(nativeMethod, this, args);
       },
       nativeMethod.length
     );
@@ -1752,7 +1944,8 @@
       "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array",
       "BigUint64Array",
     ];
-    for (const name of typedArrays) {
+    for (let _index12 = 0, _items12 = I.list(typedArrays); _index12 < _items12.length; _index12++) {
+      const name = _items12[_index12];
       const Constructor = realm[name];
       if (Constructor && Constructor.prototype) {
         installLocaleMethod(Constructor.prototype, "toLocaleString", 0, 1, false);
@@ -1769,7 +1962,8 @@
       "Collator", "NumberFormat", "PluralRules", "RelativeTimeFormat",
       "ListFormat", "DisplayNames", "Segmenter", "DurationFormat",
     ];
-    for (const name of names) {
+    for (let _index13 = 0, _items13 = I.list(names); _index13 < _items13.length; _index13++) {
+      const name = _items13[_index13];
       const Native = realm.Intl[name];
       if (typeof Native !== "function") continue;
       installConstructorOverride(realm.Intl, name, Native, (args) => {
@@ -1789,7 +1983,7 @@
         if (protectionActive() && settings.timezoneEnabled) {
           const rawOptions = args[1];
           if (rawOptions == null || rawOptions.timeZone === undefined) {
-            args[1] = Object.assign({}, rawOptions || {}, {
+            args[1] = I.Object.assign({}, rawOptions || {}, {
               timeZone: settings.timezone,
             });
           }
@@ -1801,7 +1995,7 @@
 
   // Self-contained: its source is also injected into Worker bootstraps, so it
   // must not reference anything outside its own parameters.
-  function createZoneTools(NativeDate, NativeDateTimeFormat, getTimezone) {
+  function createZoneTools(NativeDate, NativeDateTimeFormat, getTimezone, I) {
     const nativeGetTime = NativeDate.prototype.getTime;
     const nativeGetUTCMilliseconds = NativeDate.prototype.getUTCMilliseconds;
     const nativeLocal = {
@@ -1849,38 +2043,39 @@
     }
 
     function epoch(value) {
-      return Reflect.apply(nativeGetTime, value, []);
+      return I.Reflect.apply(nativeGetTime, value, []);
     }
 
     function parts(value) {
       const timestamp = epoch(value);
-      if (!Number.isFinite(timestamp)) return null;
+      if (!I.Number.isFinite(timestamp)) return null;
       refreshFormatters();
       const result = {};
-      for (const part of partsFormatter.formatToParts(value)) {
+      for (let _index14 = 0, _items14 = I.list(I.formatToParts(partsFormatter, value)); _index14 < _items14.length; _index14++) {
+        const part = _items14[_index14];
         if (part.type !== "literal") result[part.type] = part.value;
       }
       return {
-        year: result.era === "BC" ? 1 - Number(result.year) : Number(result.year),
-        month: Number(result.month),
-        day: Number(result.day),
-        hour: Number(result.hour) % 24,
-        minute: Number(result.minute),
-        second: Number(result.second),
-        millisecond: Reflect.apply(nativeGetUTCMilliseconds, value, []),
-        weekday: weekdayNames.indexOf(result.weekday),
+        year: result.era === "BC" ? 1 - I.NumberCtor(result.year) : I.NumberCtor(result.year),
+        month: I.NumberCtor(result.month),
+        day: I.NumberCtor(result.day),
+        hour: I.NumberCtor(result.hour) % 24,
+        minute: I.NumberCtor(result.minute),
+        second: I.NumberCtor(result.second),
+        millisecond: I.Reflect.apply(nativeGetUTCMilliseconds, value, []),
+        weekday: I.methods.indexOf(weekdayNames, result.weekday),
       };
     }
 
     function wallEpoch(values) {
-      const numbers = [
+      const numbers = I.methods.map([
         values.year, values.month, values.day, values.hour,
         values.minute, values.second, values.millisecond,
-      ].map(Number);
-      if (numbers.some((value) => !Number.isFinite(value))) return NaN;
+      ], I.NumberCtor);
+      if (I.methods.some(numbers, (value) => !I.Number.isFinite(value))) return NaN;
       const date = new NativeDate(0);
-      date.setUTCFullYear(numbers[0], numbers[1] - 1, numbers[2]);
-      date.setUTCHours(numbers[3], numbers[4], numbers[5], numbers[6]);
+      I.methods.setUTCFullYear(date, numbers[0], numbers[1] - 1, numbers[2]);
+      I.methods.setUTCHours(date, numbers[3], numbers[4], numbers[5], numbers[6]);
       return epoch(date);
     }
 
@@ -1893,7 +2088,7 @@
 
     function timezoneOffset(timestamp) {
       const offset = offsetAt(timestamp);
-      return Number.isNaN(offset) ? NaN : Math.trunc(offset) || 0;
+      return I.Number.isNaN(offset) ? NaN : I.Math.trunc(offset) || 0;
     }
 
     function wallToEpoch(values) {
@@ -1906,97 +2101,93 @@
         second: values.second == null ? 0 : values.second,
         millisecond: values.millisecond == null ? 0 : values.millisecond,
       });
-      if (!Number.isFinite(wall)) return NaN;
+      if (!I.Number.isFinite(wall)) return NaN;
 
-      const offsets = new Set();
-      for (const days of [-370, -183, -2, -1, 0, 1, 2, 183, 370]) {
+      const offsets = I.newSet();
+      for (let _index15 = 0, _items15 = I.list([-370, -183, -2, -1, 0, 1, 2, 183, 370]); _index15 < _items15.length; _index15++) {
+        const days = _items15[_index15];
         const offset = offsetAt(wall + days * 86400000);
-        if (Number.isFinite(offset)) offsets.add(offset);
+        if (I.Number.isFinite(offset)) I.Setadd(offsets, offset);
       }
       let probe = wall;
       for (let index = 0; index < 4; index += 1) {
         const offset = offsetAt(probe);
-        if (!Number.isFinite(offset)) break;
-        offsets.add(offset);
+        if (!I.Number.isFinite(offset)) break;
+        I.Setadd(offsets, offset);
         probe = wall + offset * 60000;
       }
 
       const candidates = [];
-      for (const offset of offsets) {
+      for (let _index16 = 0, _items16 = I.list(offsets); _index16 < _items16.length; _index16++) {
+        const offset = _items16[_index16];
         const candidate = wall + offset * 60000;
         const local = parts(new NativeDate(candidate));
         if (!local) continue;
-        candidates.push({ candidate, difference: wallEpoch(local) - wall });
+        I.methods.push(candidates, { candidate, difference: wallEpoch(local) - wall });
       }
-      const exact = candidates
-        .filter((item) => item.difference === 0)
-        .sort((left, right) => left.candidate - right.candidate);
+      const exact = I.methods.sort(I.methods.filter(candidates, (item) => item.difference === 0), (left, right) => left.candidate - right.candidate);
       if (exact.length) return exact[0].candidate;
 
-      const afterGap = candidates
-        .filter((item) => item.difference > 0)
-        .sort((left, right) =>
-          left.difference - right.difference || left.candidate - right.candidate
-        );
+      const afterGap = I.methods.sort(I.methods.filter(candidates, (item) => item.difference > 0), (left, right) =>
+          left.difference - right.difference || left.candidate - right.candidate);
       if (afterGap.length) return afterGap[0].candidate;
-      const beforeGap = candidates.sort((left, right) =>
-        right.difference - left.difference || left.candidate - right.candidate
-      );
+      const beforeGap = I.methods.sort(candidates, (left, right) =>
+        right.difference - left.difference || left.candidate - right.candidate);
       return beforeGap.length ? beforeGap[0].candidate : NaN;
     }
 
     // MakeFullYear: ToIntegerOrInfinity(y) in 0..99 maps to 1900 + that integer.
     function makeYear(value) {
-      const year = Number(value);
-      if (Number.isNaN(year)) return NaN;
-      const integer = Math.trunc(year) || 0;
+      const year = I.NumberCtor(value);
+      if (I.Number.isNaN(year)) return NaN;
+      const integer = I.Math.trunc(year) || 0;
       return integer >= 0 && integer <= 99 ? 1900 + integer : year;
     }
 
     function yearText(year) {
-      return (year < 0 ? "-" : "") + String(Math.abs(year)).padStart(4, "0");
+      return (year < 0 ? "-" : "") + I.methods.padStart(I.StringCtor(I.Math.abs(year)), 4, "0");
     }
 
     function offsetText(offset) {
       const sign = offset <= 0 ? "+" : "-";
-      const absolute = Math.abs(Math.trunc(offset));
-      return sign + String(Math.floor(absolute / 60)).padStart(2, "0") +
-        String(absolute % 60).padStart(2, "0");
+      const absolute = I.Math.abs(I.Math.trunc(offset));
+      return sign + I.methods.padStart(I.StringCtor(I.Math.floor(absolute / 60)), 2, "0") +
+        I.methods.padStart(I.StringCtor(absolute % 60), 2, "0");
     }
 
     function nameAt(timestamp) {
       refreshFormatters();
-      const part = zoneNameFormatter.formatToParts(new NativeDate(timestamp))
-        .find((item) => item.type === "timeZoneName");
+      const part = I.methods.find(I.formatToParts(zoneNameFormatter, new NativeDate(timestamp)), (item) => item.type === "timeZoneName");
       return part ? part.value : formatterZone;
     }
 
     function yearOffsets(timestamp) {
-      const year = new NativeDate(timestamp).getUTCFullYear();
-      return [offsetAt(NativeDate.UTC(year, 0, 1)), offsetAt(NativeDate.UTC(year, 6, 1))];
+      const year = I.methods.getUTCFullYear(new NativeDate(timestamp));
+      return [offsetAt(I.dateUTC(year, 0, 1)), offsetAt(I.dateUTC(year, 6, 1))];
     }
 
     // V8 shows the zone's current standard or daylight display name, and
     // decides DST outside 1970..2038 from an equivalent recent year.
     function equivalentTime(timestamp) {
       const date = new NativeDate(timestamp);
-      const year = date.getUTCFullYear();
+      const year = I.methods.getUTCFullYear(date);
       const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
       const january = new NativeDate(0);
-      january.setUTCFullYear(year, 0, 1);
-      const recentYear = (leap ? 1956 : 1967) + (january.getUTCDay() * 12) % 28;
-      date.setUTCFullYear(2008 + (recentYear + 3 * 28 - 2008) % 28);
+      I.methods.setUTCFullYear(january, year, 0, 1);
+      const recentYear = (leap ? 1956 : 1967) + (I.methods.getUTCDay(january) * 12) % 28;
+      I.methods.setUTCFullYear(date, 2008 + (recentYear + 3 * 28 - 2008) % 28);
       return epoch(date);
     }
 
     function zoneName(value) {
       refreshFormatters();
       if (!currentNames) {
-        const now = NativeDate.now();
-        const [january, july] = yearOffsets(now);
-        const year = new NativeDate(now).getUTCFullYear();
-        const januaryTime = NativeDate.UTC(year, 0, 1);
-        const julyTime = NativeDate.UTC(year, 6, 1);
+        const now = I.dateNow();
+        const seasonalOffsets = yearOffsets(now);
+        const january = seasonalOffsets[0], july = seasonalOffsets[1];
+        const year = I.methods.getUTCFullYear(new NativeDate(now));
+        const januaryTime = I.dateUTC(year, 0, 1);
+        const julyTime = I.dateUTC(year, 6, 1);
         currentNames = january === july
           ? { standard: nameAt(januaryTime), daylight: null }
           : {
@@ -2008,7 +2199,7 @@
       const probe = timestamp < 0 || timestamp > MAX_EPOCH_MS
         ? equivalentTime(timestamp)
         : timestamp;
-      const daylight = offsetAt(probe) < Math.max(...yearOffsets(probe));
+      const daylight = offsetAt(probe) < I.Reflect.apply(I.Math.max, undefined, yearOffsets(probe));
       if (!daylight) return currentNames.standard;
       return currentNames.daylight || nameAt(timestamp);
     }
@@ -2017,36 +2208,36 @@
       const item = parts(value);
       if (!item) return "Invalid Date";
       return weekdayNames[item.weekday] + " " + monthNames[item.month - 1] + " " +
-        String(item.day).padStart(2, "0") + " " + yearText(item.year);
+        I.methods.padStart(I.StringCtor(item.day), 2, "0") + " " + yearText(item.year);
     }
 
     function timeText(value) {
       const item = parts(value);
       if (!item) return "Invalid Date";
-      return String(item.hour).padStart(2, "0") + ":" +
-        String(item.minute).padStart(2, "0") + ":" +
-        String(item.second).padStart(2, "0") + " GMT" +
+      return I.methods.padStart(I.StringCtor(item.hour), 2, "0") + ":" +
+        I.methods.padStart(I.StringCtor(item.minute), 2, "0") + ":" +
+        I.methods.padStart(I.StringCtor(item.second), 2, "0") + " GMT" +
         offsetText(offsetAt(epoch(value))) + " (" + zoneName(value) + ")";
     }
 
     function fullText(value) {
-      return Number.isFinite(epoch(value))
+      return I.Number.isFinite(epoch(value))
         ? dateText(value) + " " + timeText(value)
         : "Invalid Date";
     }
 
     function isAmbiguous(value) {
-      const source = String(value).trim();
-      if (/^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/.test(source)) return false;
+      const source = I.methods.trim(I.StringCtor(value));
+      if (I.methods.test(/^(?:\d{4}|[+-]\d{6})(?:-\d{2}(?:-\d{2})?)?$/, source)) return false;
       return !(
-        /Z$/i.test(source) ||
-        /\b(?:UTC|GMT|[ECMP][SD]T)\b/i.test(source) ||
-        /[+-]\d{2}(?::?\d{2})?(?:\s*\([^)]*\))?$/.test(source)
+        I.methods.test(/Z$/i, source) ||
+        I.methods.test(/\b(?:UTC|GMT|[ECMP][SD]T)\b/i, source) ||
+        I.methods.test(/[+-]\d{2}(?::?\d{2})?(?:\s*\([^)]*\))?$/, source)
       );
     }
 
     function localFields(date) {
-      const read = (name) => Reflect.apply(nativeLocal[name], date, []);
+      const read = (name) => I.Reflect.apply(nativeLocal[name], date, []);
       return {
         year: read("getFullYear"),
         month: read("getMonth") + 1,
@@ -2060,25 +2251,25 @@
 
     // Reinterprets a zone-less date string as wall time in the target zone.
     function parseLocal(value) {
-      const source = String(value);
+      const source = I.StringCtor(value);
       const parsed = new NativeDate(source);
-      if (!Number.isFinite(epoch(parsed)) || !isAmbiguous(source)) return epoch(parsed);
+      if (!I.Number.isFinite(epoch(parsed)) || !isAmbiguous(source)) return epoch(parsed);
       let fields = localFields(parsed);
       // Parsing in the real zone shifts wall times that fall in its DST gap,
       // so prefer the same string read as UTC when that is equivalent.
       const marked = new NativeDate(
-        /^[+-]?\d{4,6}-\d{2}-\d{2}T/i.test(source.trim()) ? source.trim() + "Z" : source + " GMT"
+        I.methods.test(/^[+-]?\d{4,6}-\d{2}-\d{2}T/i, I.methods.trim(source)) ? I.methods.trim(source) + "Z" : source + " GMT"
       );
-      if (Number.isFinite(epoch(marked)) &&
-          Math.abs(epoch(marked) - wallEpoch(fields)) <= 86400000) {
+      if (I.Number.isFinite(epoch(marked)) &&
+          I.Math.abs(epoch(marked) - wallEpoch(fields)) <= 86400000) {
         fields = {
-          year: marked.getUTCFullYear(),
-          month: marked.getUTCMonth() + 1,
-          day: marked.getUTCDate(),
-          hour: marked.getUTCHours(),
-          minute: marked.getUTCMinutes(),
-          second: marked.getUTCSeconds(),
-          millisecond: marked.getUTCMilliseconds(),
+          year: I.methods.getUTCFullYear(marked),
+          month: I.methods.getUTCMonth(marked) + 1,
+          day: I.methods.getUTCDate(marked),
+          hour: I.methods.getUTCHours(marked),
+          minute: I.methods.getUTCMinutes(marked),
+          second: I.methods.getUTCSeconds(marked),
+          millisecond: I.methods.getUTCMilliseconds(marked),
         };
       }
       return wallToEpoch(fields);
@@ -2107,12 +2298,12 @@
     }
 
     function applyNative(method, receiver, args) {
-      return Reflect.apply(native[method], receiver, Array.prototype.slice.call(args));
+      return I.Reflect.apply(native[method], receiver, I.list(args));
     }
 
     function currentParts(receiver, fullYearSpecial) {
       const timestamp = tools.epoch(receiver);
-      if (Number.isFinite(timestamp)) return tools.parts(receiver);
+      if (I.Number.isFinite(timestamp)) return tools.parts(receiver);
       return fullYearSpecial
         ? { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 }
         : null;
@@ -2120,7 +2311,7 @@
 
     function commit(receiver, values) {
       const timestamp = tools.wallToEpoch(values);
-      Reflect.apply(native.setTime, receiver, [timestamp]);
+      I.Reflect.apply(native.setTime, receiver, [timestamp]);
       return timestamp;
     }
 
@@ -2131,10 +2322,10 @@
         if (!item) return NaN;
         return commit(this, {
           year: item.year, month: item.month, day: item.day,
-          hour: Number(hour),
-          minute: arguments.length >= 2 ? Number(minute) : item.minute,
-          second: arguments.length >= 3 ? Number(second) : item.second,
-          millisecond: arguments.length >= 4 ? Number(ms) : item.millisecond,
+          hour: I.NumberCtor(hour),
+          minute: arguments.length >= 2 ? I.NumberCtor(minute) : item.minute,
+          second: arguments.length >= 3 ? I.NumberCtor(second) : item.second,
+          millisecond: arguments.length >= 4 ? I.NumberCtor(ms) : item.millisecond,
         });
       } catch (_) {
         return applyNative("setHours", this, arguments);
@@ -2148,9 +2339,9 @@
         if (!item) return NaN;
         return commit(this, {
           year: item.year, month: item.month, day: item.day, hour: item.hour,
-          minute: Number(minute),
-          second: arguments.length >= 2 ? Number(second) : item.second,
-          millisecond: arguments.length >= 3 ? Number(ms) : item.millisecond,
+          minute: I.NumberCtor(minute),
+          second: arguments.length >= 2 ? I.NumberCtor(second) : item.second,
+          millisecond: arguments.length >= 3 ? I.NumberCtor(ms) : item.millisecond,
         });
       } catch (_) {
         return applyNative("setMinutes", this, arguments);
@@ -2164,8 +2355,8 @@
         if (!item) return NaN;
         return commit(this, {
           year: item.year, month: item.month, day: item.day, hour: item.hour,
-          minute: item.minute, second: Number(second),
-          millisecond: arguments.length >= 2 ? Number(ms) : item.millisecond,
+          minute: item.minute, second: I.NumberCtor(second),
+          millisecond: arguments.length >= 2 ? I.NumberCtor(ms) : item.millisecond,
         });
       } catch (_) {
         return applyNative("setSeconds", this, arguments);
@@ -2178,7 +2369,7 @@
         const item = currentParts(this, false);
         if (!item) return NaN;
         return commit(this, {
-          year: item.year, month: item.month, day: Number(day), hour: item.hour,
+          year: item.year, month: item.month, day: I.NumberCtor(day), hour: item.hour,
           minute: item.minute, second: item.second, millisecond: item.millisecond,
         });
       } catch (_) {
@@ -2193,8 +2384,8 @@
         if (!item) return NaN;
         return commit(this, {
           year: item.year,
-          month: Number(month) + 1,
-          day: arguments.length >= 2 ? Number(day) : item.day,
+          month: I.NumberCtor(month) + 1,
+          day: arguments.length >= 2 ? I.NumberCtor(day) : item.day,
           hour: item.hour, minute: item.minute, second: item.second,
           millisecond: item.millisecond,
         });
@@ -2209,11 +2400,11 @@
         const item = currentParts(this, true);
         if (!item) return applyNative("setFullYear", this, arguments);
         return commit(this, {
-          year: Number(year),
-          month: arguments.length >= 2 ? Number(month) + 1 : item.month,
-          day: arguments.length >= 3 ? Number(day) : item.day,
+          year: I.NumberCtor(year),
+          month: arguments.length >= 2 ? I.NumberCtor(month) + 1 : item.month,
+          day: arguments.length >= 3 ? I.NumberCtor(day) : item.day,
           hour: item.hour, minute: item.minute, second: item.second,
-          millisecond: Number.isFinite(tools.epoch(this)) ? item.millisecond : 0,
+          millisecond: I.Number.isFinite(tools.epoch(this)) ? item.millisecond : 0,
         });
       } catch (_) {
         return applyNative("setFullYear", this, arguments);
@@ -2230,7 +2421,7 @@
           return commit(this, {
             year: numericYear, month: item.month, day: item.day, hour: item.hour,
             minute: item.minute, second: item.second,
-            millisecond: Number.isFinite(tools.epoch(this)) ? item.millisecond : 0,
+            millisecond: I.Number.isFinite(tools.epoch(this)) ? item.millisecond : 0,
           });
         } catch (_) {
           return applyNative("setYear", this, arguments);
@@ -2242,41 +2433,42 @@
   function installXsltOverrides(realm, NativeDate, tools) {
     const Constructor = realm.XSLTProcessor;
     if (!Constructor || !Constructor.prototype) return;
-    const pad = (value, length) => String(value).padStart(length, "0");
-    const rewrite = (value) => value.replace(
-      /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b/g,
-      (match, fractional) => {
+    const pad = (value, length) => I.methods.padStart(I.StringCtor(value), length, "0");
+    const rewrite = (value) => I.methods.replace(value, /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(?:Z|[+-]\d{2}:\d{2})\b/g, (match, fractional) => {
         const instant = new NativeDate(match);
-        const timestamp = instant.getTime();
+        const timestamp = I.methods.getTime(instant);
         if (
           !protectionActive() ||
           !settings.timezoneEnabled ||
-          !Number.isFinite(timestamp) ||
-          Math.abs(timestamp - NativeDate.now()) > 120000
+          !I.Number.isFinite(timestamp) ||
+          I.Math.abs(timestamp - I.dateNow()) > 120000
         ) return match;
         const item = tools.parts(instant);
         if (!item) return match;
         const offset = tools.offsetAt(timestamp);
         const sign = offset <= 0 ? "+" : "-";
-        const absolute = Math.abs(Math.trunc(offset));
+        const absolute = I.Math.abs(I.Math.trunc(offset));
         return pad(item.year, 4) + "-" + pad(item.month, 2) + "-" + pad(item.day, 2) +
           "T" + pad(item.hour, 2) + ":" + pad(item.minute, 2) + ":" +
           pad(item.second, 2) + (fractional || "") + sign +
-          pad(Math.floor(absolute / 60), 2) + ":" + pad(absolute % 60, 2);
-      }
-    );
+          pad(I.Math.floor(absolute / 60), 2) + ":" + pad(absolute % 60, 2);
+      });
     const rewriteTree = (node) => {
       if (!node) return;
       if (node.nodeType === 3 && typeof node.nodeValue === "string") {
         node.nodeValue = rewrite(node.nodeValue);
       }
-      for (const child of Array.from(node.childNodes || [])) rewriteTree(child);
+      for (let _index17 = 0, _items17 = I.list(I.Array.from(node.childNodes || [])); _index17 < _items17.length; _index17++) {
+        const child = _items17[_index17];
+        rewriteTree(child);
+      }
     };
-    for (const property of ["transformToFragment", "transformToDocument"]) {
+    for (let _index18 = 0, _items18 = I.list(["transformToFragment", "transformToDocument"]); _index18 < _items18.length; _index18++) {
+      const property = _items18[_index18];
       const nativeMethod = Constructor.prototype[property];
       if (typeof nativeMethod !== "function") continue;
       installOverride(Constructor.prototype, property, function xsltTransform() {
-        const result = Reflect.apply(nativeMethod, this, Array.prototype.slice.call(arguments));
+        const result = I.Reflect.apply(nativeMethod, this, I.list(arguments));
         try {
           rewriteTree(result);
         } catch (_) {
@@ -2290,29 +2482,29 @@
   function installDocumentOverrides(realm, NativeDate, tools) {
     const DocumentPrototype = realm.Document && realm.Document.prototype;
     if (!DocumentPrototype) return;
-    const descriptor = Object.getOwnPropertyDescriptor(DocumentPrototype, "lastModified");
+    const descriptor = I.Object.getOwnPropertyDescriptor(DocumentPrototype, "lastModified");
     if (!descriptor || typeof descriptor.get !== "function") return;
     const nativeGet = descriptor.get;
     installAccessor(DocumentPrototype, "lastModified", {
       get: function documentLastModifiedGetter() {
-        const nativeValue = Reflect.apply(nativeGet, this, []);
+        const nativeValue = I.Reflect.apply(nativeGet, this, []);
         if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
         const parsed = new NativeDate(nativeValue);
         const item = tools.parts(parsed);
         if (!item) return nativeValue;
-        return String(item.month).padStart(2, "0") + "/" +
-          String(item.day).padStart(2, "0") + "/" +
+        return I.methods.padStart(I.StringCtor(item.month), 2, "0") + "/" +
+          I.methods.padStart(I.StringCtor(item.day), 2, "0") + "/" +
           tools.yearText(item.year) + " " +
-          String(item.hour).padStart(2, "0") + ":" +
-          String(item.minute).padStart(2, "0") + ":" +
-          String(item.second).padStart(2, "0");
+          I.methods.padStart(I.StringCtor(item.hour), 2, "0") + ":" +
+          I.methods.padStart(I.StringCtor(item.minute), 2, "0") + ":" +
+          I.methods.padStart(I.StringCtor(item.second), 2, "0");
       },
     });
   }
 
   function installDateOverrides(realm, NativeDate, NativeDateTimeFormat) {
     if (!realm.Date || !NativeDate || !settings.timezone) return;
-    const tools = createZoneTools(NativeDate, NativeDateTimeFormat, () => settings.timezone);
+    const tools = createZoneTools(NativeDate, NativeDateTimeFormat, () => settings.timezone, I);
     const prototype = NativeDate.prototype;
     const nativeGetters = {
       getTime: prototype.getTime,
@@ -2341,12 +2533,13 @@
       getMilliseconds: "millisecond",
       getYear: "year",
     };
-    for (const property of Object.keys(partKeys)) {
+    for (let _index19 = 0, _items19 = I.list(I.Object.keys(partKeys)); _index19 < _items19.length; _index19++) {
+      const property = _items19[_index19];
       installOverride(
         prototype,
         property,
         function timezoneDateGetter() {
-          const nativeValue = Reflect.apply(nativeGetters[property], this, []);
+          const nativeValue = I.Reflect.apply(nativeGetters[property], this, []);
           if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
           const item = tools.parts(this);
           if (!item) return NaN;
@@ -2362,7 +2555,7 @@
       prototype,
       "getTimezoneOffset",
       function getTimezoneOffset() {
-        const nativeValue = Reflect.apply(nativeGetters.getTimezoneOffset, this, []);
+        const nativeValue = I.Reflect.apply(nativeGetters.getTimezoneOffset, this, []);
         if (!protectionActive() || !settings.timezoneEnabled) return nativeValue;
         return tools.timezoneOffset(tools.epoch(this));
       },
@@ -2372,7 +2565,7 @@
       prototype,
       "toDateString",
       function toDateString() {
-        const nativeValue = Reflect.apply(nativeGetters.toDateString, this, []);
+        const nativeValue = I.Reflect.apply(nativeGetters.toDateString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.dateText(this) : nativeValue;
       },
       0
@@ -2381,7 +2574,7 @@
       prototype,
       "toTimeString",
       function toTimeString() {
-        const nativeValue = Reflect.apply(nativeGetters.toTimeString, this, []);
+        const nativeValue = I.Reflect.apply(nativeGetters.toTimeString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.timeText(this) : nativeValue;
       },
       0
@@ -2390,7 +2583,7 @@
       prototype,
       "toString",
       function toString() {
-        const nativeValue = Reflect.apply(nativeGetters.toString, this, []);
+        const nativeValue = I.Reflect.apply(nativeGetters.toString, this, []);
         return protectionActive() && settings.timezoneEnabled ? tools.fullText(this) : nativeValue;
       },
       0
@@ -2400,78 +2593,78 @@
     installXsltOverrides(realm, NativeDate, tools);
     installDocumentOverrides(realm, NativeDate, tools);
 
-    const nativeDateParse = NativeDate.parse;
-    const globalDescriptor = Object.getOwnPropertyDescriptor(realm, "Date");
-    let WrappedDate = function Date() {
-      const args = Array.prototype.slice.call(arguments);
+    const nativeDateParse = I.dateParse;
+    const globalDescriptor = I.Object.getOwnPropertyDescriptor(realm, "Date");
+    let WrappedDate = function Date(...args) {
+
       if (!new.target) {
         if (!protectionActive() || !settings.timezoneEnabled) return NativeDate();
         return tools.fullText(new NativeDate());
       }
       if (!protectionActive() || !settings.timezoneEnabled) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
-        return Reflect.construct(NativeDate, args, target);
+        return I.Reflect.construct(NativeDate, args, target);
       }
       if (args.length === 1) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
         if (typeof args[0] === "string" && tools.isAmbiguous(args[0])) {
-          return Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target);
+          return I.Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target);
         }
-        return Reflect.construct(NativeDate, args, target);
+        return I.Reflect.construct(NativeDate, args, target);
       }
       if (args.length < 2) {
         const target = new.target === WrappedDate ? NativeDate : new.target;
-        return Reflect.construct(NativeDate, args, target);
+        return I.Reflect.construct(NativeDate, args, target);
       }
       const timestamp = tools.wallToEpoch({
         year: tools.makeYear(args[0]),
-        month: Number(args[1]) + 1,
-        day: args.length > 2 ? Number(args[2]) : 1,
-        hour: args.length > 3 ? Number(args[3]) : 0,
-        minute: args.length > 4 ? Number(args[4]) : 0,
-        second: args.length > 5 ? Number(args[5]) : 0,
-        millisecond: args.length > 6 ? Number(args[6]) : 0,
+        month: I.NumberCtor(args[1]) + 1,
+        day: args.length > 2 ? I.NumberCtor(args[2]) : 1,
+        hour: args.length > 3 ? I.NumberCtor(args[3]) : 0,
+        minute: args.length > 4 ? I.NumberCtor(args[4]) : 0,
+        second: args.length > 5 ? I.NumberCtor(args[5]) : 0,
+        millisecond: args.length > 6 ? I.NumberCtor(args[6]) : 0,
       });
       const target = new.target === WrappedDate ? NativeDate : new.target;
-      return Reflect.construct(NativeDate, [timestamp], target);
+      return I.Reflect.construct(NativeDate, [timestamp], target);
     };
     registerOverride(WrappedDate, "Date");
     disguiseAsNative(WrappedDate, "Date", NativeDate.length);
-    Object.setPrototypeOf(WrappedDate, Object.getPrototypeOf(NativeDate));
+    I.Object.setPrototypeOf(WrappedDate, I.Object.getPrototypeOf(NativeDate));
     copyConstructorStatics(NativeDate, WrappedDate);
     const wrappedParse = function parse(value) {
       if (!protectionActive() || !settings.timezoneEnabled) {
-        return Reflect.apply(nativeDateParse, NativeDate, arguments);
+        return I.Reflect.apply(nativeDateParse, NativeDate, arguments);
       }
       const stringValue = typeof value === "string" ? value : "" + value;
       if (!tools.isAmbiguous(stringValue)) {
-        return Reflect.apply(nativeDateParse, NativeDate, [stringValue]);
+        return I.Reflect.apply(nativeDateParse, NativeDate, [stringValue]);
       }
       return tools.parseLocal(stringValue);
     };
     registerOverride(wrappedParse, "parse");
     disguiseAsNative(wrappedParse, "parse", nativeDateParse.length);
-    Object.defineProperty(WrappedDate, "parse", {
+    I.Object.defineProperty(WrappedDate, "parse", {
       value: wrappedParse,
       writable: true,
       enumerable: false,
       configurable: true,
     });
-    Object.defineProperty(WrappedDate, "prototype", {
+    I.Object.defineProperty(WrappedDate, "prototype", {
       value: NativeDate.prototype,
       writable: false,
       enumerable: false,
       configurable: false,
     });
     const dateConstructorDescriptor =
-      Object.getOwnPropertyDescriptor(NativeDate.prototype, "constructor");
-    Object.defineProperty(NativeDate.prototype, "constructor", {
+      I.Object.getOwnPropertyDescriptor(NativeDate.prototype, "constructor");
+    I.Object.defineProperty(NativeDate.prototype, "constructor", {
       value: WrappedDate,
       writable: dateConstructorDescriptor ? dateConstructorDescriptor.writable : true,
       enumerable: dateConstructorDescriptor ? dateConstructorDescriptor.enumerable : false,
       configurable: dateConstructorDescriptor ? dateConstructorDescriptor.configurable : true,
     });
-    Object.defineProperty(realm, "Date", {
+    I.Object.defineProperty(realm, "Date", {
       value: WrappedDate,
       configurable: globalDescriptor ? globalDescriptor.configurable : true,
       enumerable: globalDescriptor ? globalDescriptor.enumerable : false,
@@ -2481,21 +2674,22 @@
 
   // Shared by windows and worker payloads. Explicit zones, including invalid
   // arguments, are delegated unchanged; only an omitted/undefined zone defaults.
-  function patchTemporalOverrides(realm, getTimezone, install, getLocales) {
+  function patchTemporalOverrides(realm, getTimezone, install, getLocales, I) {
     const now = realm.Temporal && realm.Temporal.Now;
     if (!now) return;
-    for (const property of [
+    for (let _index20 = 0, _items20 = I.list([
       "timeZoneId", "plainDateTimeISO", "plainDateISO", "plainTimeISO", "zonedDateTimeISO",
-    ]) {
+    ]); _index20 < _items20.length; _index20++) {
+      const property = _items20[_index20];
       const nativeMethod = now[property];
       if (typeof nativeMethod !== "function") continue;
       const method = {
-        [property]() {
+        [property](...args) {
           const timezone = getTimezone();
           if (property === "timeZoneId" && timezone) return timezone;
-          const args = Array.prototype.slice.call(arguments);
+
           if (property !== "timeZoneId" && args[0] === undefined && timezone) args[0] = timezone;
-          return Reflect.apply(nativeMethod, this, args);
+          return I.Reflect.apply(nativeMethod, this, args);
         },
       }[property];
       install(now, property, method);
@@ -2504,10 +2698,10 @@
     const nativeLocaleString = prototype && prototype.toLocaleString;
     if (typeof nativeLocaleString !== "function") return;
     install(prototype, "toLocaleString", {
-      toLocaleString() {
-        const args = Array.prototype.slice.call(arguments);
+      toLocaleString(...args) {
+
         const locales = getLocales();
-        if (locales && (args[0] === undefined || (Array.isArray(args[0]) && !args[0].length))) {
+        if (locales && (args[0] === undefined || (I.Array.isArray(args[0]) && !args[0].length))) {
           args[0] = locales;
         }
         const timezone = getTimezone();
@@ -2516,15 +2710,15 @@
         else if (timezone && options !== null) {
           // Preserve inherited options, getter order and invalid-option errors.
           // Let native Intl read each property once, substituting only the default.
-          const originalOptions = Object(options);
+          const originalOptions = I.ObjectCtor(options);
           // An empty proxy target also supports frozen {timeZone: undefined};
           // overriding that property on the original target violates invariants.
-          args[1] = new Proxy({}, { get(_, key) {
-            const value = Reflect.get(originalOptions, key, originalOptions);
+          args[1] = new I.Proxy({}, { get(_, key) {
+            const value = I.Reflect.get(originalOptions, key, originalOptions);
             return key === "timeZone" && value === undefined ? timezone : value;
           } });
         }
-        return Reflect.apply(nativeLocaleString, this, args);
+        return I.Reflect.apply(nativeLocaleString, this, args);
       },
     }.toLocaleString);
   }
@@ -2538,7 +2732,7 @@
     installLocaleMethods(realm);
     patchTemporalOverrides(realm, () => protectionActive() && settings.timezoneEnabled
       ? settings.timezone : null, installOverride,
-      () => protectionActive() && settings.localeEnabled ? settings.languages : null);
+      () => protectionActive() && settings.localeEnabled ? settings.languages : null, I);
   }
 
   function patchWindow(realm) {
@@ -2546,9 +2740,9 @@
     // Key by the realm's intrinsics: a WindowProxy survives navigation, while a
     // Window reused for a new document keeps its already patched globals.
     const realmKey = genuineFunctionPrototype(realm);
-    if (!realmKey || patchedRealms.has(realmKey)) return false;
-    patchedRealms.add(realmKey);
-    knownRealms.add(realmKey);
+    if (!realmKey || I.WeakSethas(patchedRealms, realmKey)) return false;
+    I.WeakSetadd(patchedRealms, realmKey);
+    I.WeakSetadd(knownRealms, realmKey);
     // Another instance (inside that frame, or a re-injection) already owns it.
     if (realmMasked(realmKey)) return false;
     try {
@@ -2577,7 +2771,7 @@
         Permissions: realm.Permissions,
         PermissionStatus: realm.PermissionStatus,
         EventTarget: realm.EventTarget,
-        reportError: typeof realm.reportError === "function" ? realm.reportError.bind(realm) : null,
+        reportError: typeof realm.reportError === "function" ? I.bind(realm.reportError, realm) : null,
         navigator: realm.navigator,
       };
       installGeolocationObjectModel(apiRealm);
@@ -2598,15 +2792,15 @@
   }
 
   function tryPatchIframe(iframe, inserted = false) {
-    if (!iframe || String(iframe.tagName).toUpperCase() !== "IFRAME") return;
-    if (!iframe.isConnected || (!inserted && watchedIframes.has(iframe))) return;
+    if (!iframe || I.methods.toUpperCase(I.StringCtor(iframe.tagName)) !== "IFRAME") return;
+    if (!iframe.isConnected || (!inserted && I.WeakSethas(watchedIframes, iframe))) return;
     try {
       patchWindow(iframe.contentWindow);
     } catch (_) {
       // Cross-origin frame: inaccessible by design.
     }
-    if (watchedIframes.has(iframe)) return;
-    watchedIframes.add(iframe);
+    if (I.WeakSethas(watchedIframes, iframe)) return;
+    I.WeakSetadd(watchedIframes, iframe);
     iframe.addEventListener(
       "load",
       () => {
@@ -2621,10 +2815,13 @@
   }
 
   function scanNodeForIframes(node) {
-    if (!node || ![1, 9, 11].includes(node.nodeType)) return;
-    if (String(node.tagName).toUpperCase() === "IFRAME") tryPatchIframe(node);
+    if (!node || !I.methods.includes([1, 9, 11], node.nodeType)) return;
+    if (I.methods.toUpperCase(I.StringCtor(node.tagName)) === "IFRAME") tryPatchIframe(node);
     if (node.firstChild && typeof node.querySelectorAll === "function") {
-      for (const iframe of node.querySelectorAll("iframe")) tryPatchIframe(iframe);
+      for (let _index21 = 0, _items21 = I.list(node.querySelectorAll("iframe")); _index21 < _items21.length; _index21++) {
+        const iframe = _items21[_index21];
+        tryPatchIframe(iframe);
+      }
     }
   }
 
@@ -2633,7 +2830,7 @@
     if (!realmKey) return;
     // Keep each realm's observer intrinsics before page code can replace them.
     // Repeated installation must reuse these captures, including the async path.
-    let observerApi = iframeObserverApis.get(realmKey);
+    let observerApi = I.WeakMapget(iframeObserverApis, realmKey);
     if (!observerApi) {
       const Constructor = realm.MutationObserver;
       observerApi = {
@@ -2641,21 +2838,22 @@
         observe: Constructor.prototype.observe,
         takeRecords: Constructor.prototype.takeRecords,
         disconnect: Constructor.prototype.disconnect,
-        addedNodes: Object.getOwnPropertyDescriptor(realm.MutationRecord.prototype, "addedNodes").get,
+        addedNodes: I.Object.getOwnPropertyDescriptor(realm.MutationRecord.prototype, "addedNodes").get,
       };
-      iframeObserverApis.set(realmKey, observerApi);
+      I.WeakMapset(iframeObserverApis, realmKey, observerApi);
     }
     const doc = realm.document;
-    if (!coveredIframeRealms.has(realmKey)) {
-      coveredIframeRealms.add(realmKey);
+    if (!I.WeakSethas(coveredIframeRealms, realmKey)) {
+      I.WeakSetadd(coveredIframeRealms, realmKey);
       if (realm.HTMLIFrameElement) {
-        for (const property of ["contentWindow", "contentDocument"]) {
+        for (let _index22 = 0, _items22 = I.list(["contentWindow", "contentDocument"]); _index22 < _items22.length; _index22++) {
+          const property = _items22[_index22];
           const target = realm.HTMLIFrameElement.prototype;
-          const descriptor = Object.getOwnPropertyDescriptor(target, property);
+          const descriptor = I.Object.getOwnPropertyDescriptor(target, property);
           if (!descriptor || typeof descriptor.get !== "function") continue;
           installAccessor(target, property, {
             get: function iframeRealmGetter() {
-              const value = Reflect.apply(descriptor.get, this, []);
+              const value = I.Reflect.apply(descriptor.get, this, []);
               try {
                 patchWindow(property === "contentWindow" ? value : value && value.defaultView);
               } catch (_) {}
@@ -2668,9 +2866,9 @@
       // Node-taking APIs collect only their inserted subtrees, before native
       // insertion empties DocumentFragments. Text and empty elements are O(1).
       const nodePrototype = realm.Node.prototype;
-      const nodeType = Object.getOwnPropertyDescriptor(nodePrototype, "nodeType").get;
-      const firstChild = Object.getOwnPropertyDescriptor(nodePrototype, "firstChild").get;
-      const parentNode = Object.getOwnPropertyDescriptor(nodePrototype, "parentNode").get;
+      const nodeType = I.Object.getOwnPropertyDescriptor(nodePrototype, "nodeType").get;
+      const firstChild = I.Object.getOwnPropertyDescriptor(nodePrototype, "firstChild").get;
+      const parentNode = I.Object.getOwnPropertyDescriptor(nodePrototype, "parentNode").get;
       const queries = {
         1: realm.Element.prototype.querySelectorAll,
         9: realm.Document.prototype.querySelectorAll,
@@ -2679,24 +2877,30 @@
       const collect = (node, frames) => {
         if (!node || (typeof node !== "object" && typeof node !== "function")) return;
         let type;
-        try { type = Reflect.apply(nodeType, node, []); } catch (_) { return; }
+        try { type = I.Reflect.apply(nodeType, node, []); } catch (_) { return; }
         if (!queries[type]) return;
-        if (type === 1 && node.localName === "iframe") frames.add(node);
-        if (!Reflect.apply(firstChild, node, [])) return;
-        for (const frame of Reflect.apply(queries[type], node, ["iframe"])) frames.add(frame);
+        if (type === 1 && node.localName === "iframe") I.Setadd(frames, node);
+        if (!I.Reflect.apply(firstChild, node, [])) return;
+        for (let _index23 = 0, _items23 = I.list(I.Reflect.apply(queries[type], node, ["iframe"])); _index23 < _items23.length; _index23++) {
+          const frame = _items23[_index23];
+          I.Setadd(frames, frame);
+        }
       };
       const patch = (frames) => {
-        for (const frame of frames) tryPatchIframe(frame, true);
+        for (let _index24 = 0, _items24 = I.list(frames); _index24 < _items24.length; _index24++) {
+          const frame = _items24[_index24];
+          tryPatchIframe(frame, true);
+        }
       };
       const wrapNodes = (prototype, property, argumentIndex) => {
-        const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, property);
+        const descriptor = prototype && I.Object.getOwnPropertyDescriptor(prototype, property);
         if (!descriptor || typeof descriptor.value !== "function") return;
         installOverride(prototype, property, function domInsertion() {
-          const frames = new Set();
+          const frames = I.newSet();
           if (argumentIndex === undefined) {
             for (let index = 0; index < arguments.length; index++) collect(arguments[index], frames);
           } else collect(arguments[argumentIndex], frames);
-          const result = Reflect.apply(descriptor.value, this, arguments);
+          const result = I.Reflect.apply(descriptor.value, this, arguments);
           patch(frames);
           return result;
         });
@@ -2705,45 +2909,54 @@
       // nodes. A short-lived observer records just this operation's additions;
       // takeRecords is synchronous and never scans the destination's old DOM.
       const observeInsertion = (receiver, nativeMethod, args, useParent) => {
-        const observer = Reflect.construct(observerApi.Constructor, [() => {}]);
+        const observer = I.Reflect.construct(observerApi.Constructor, [() => {}]);
         try {
           let target = receiver;
-          if (useParent) target = Reflect.apply(parentNode, receiver, []) || receiver;
-          Reflect.apply(observerApi.observe, observer, [target, { childList: true, subtree: true }]);
+          if (useParent) target = I.Reflect.apply(parentNode, receiver, []) || receiver;
+          I.Reflect.apply(observerApi.observe, observer, [target, { childList: true, subtree: true }]);
         } catch (_) { /* The native operation below owns receiver validation. */ }
         try {
-          const result = Reflect.apply(nativeMethod, receiver, args);
-          const frames = new Set();
-          for (const record of Reflect.apply(observerApi.takeRecords, observer, [])) {
-            for (const node of Reflect.apply(observerApi.addedNodes, record, [])) collect(node, frames);
+          const result = I.Reflect.apply(nativeMethod, receiver, args);
+          const frames = I.newSet();
+          for (let _index25 = 0, _items25 = I.list(I.Reflect.apply(observerApi.takeRecords, observer, [])); _index25 < _items25.length; _index25++) {
+            const record = _items25[_index25];
+            for (let _index26 = 0, _items26 = I.list(I.Reflect.apply(observerApi.addedNodes, record, [])); _index26 < _items26.length; _index26++) {
+              const node = _items26[_index26];
+              collect(node, frames);
+            }
           }
           patch(frames);
           return result;
-        } finally { Reflect.apply(observerApi.disconnect, observer, []); }
+        } finally { I.Reflect.apply(observerApi.disconnect, observer, []); }
       };
       const wrapHTML = (prototype, property, useParent) => {
-        const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, property);
+        const descriptor = prototype && I.Object.getOwnPropertyDescriptor(prototype, property);
         if (!descriptor || typeof descriptor.value !== "function") return;
         installOverride(prototype, property, function htmlInsertion() {
           return observeInsertion(this, descriptor.value, arguments, useParent);
         });
       };
-      for (const property of ["appendChild", "insertBefore", "replaceChild"]) {
+      for (let _index27 = 0, _items27 = I.list(["appendChild", "insertBefore", "replaceChild"]); _index27 < _items27.length; _index27++) {
+        const property = _items27[_index27];
         wrapNodes(nodePrototype, property, 0);
       }
-      for (const constructor of [realm.Element, realm.Document, realm.DocumentFragment,
-        realm.CharacterData, realm.DocumentType]) {
-        for (const property of ["append", "prepend", "replaceChildren", "before", "after", "replaceWith"]) {
+      for (let _index28 = 0, _items28 = I.list([realm.Element, realm.Document, realm.DocumentFragment,
+        realm.CharacterData, realm.DocumentType]); _index28 < _items28.length; _index28++) {
+        const constructor = _items28[_index28];
+        for (let _index29 = 0, _items29 = I.list(["append", "prepend", "replaceChildren", "before", "after", "replaceWith"]); _index29 < _items29.length; _index29++) {
+          const property = _items29[_index29];
           wrapNodes(constructor && constructor.prototype, property);
         }
       }
       wrapNodes(realm.Element.prototype, "insertAdjacentElement", 1);
       wrapHTML(realm.Element.prototype, "insertAdjacentHTML", true);
-      for (const constructor of [realm.Element, realm.ShadowRoot]) {
+      for (let _index30 = 0, _items30 = I.list([realm.Element, realm.ShadowRoot]); _index30 < _items30.length; _index30++) {
+        const constructor = _items30[_index30];
         const prototype = constructor && constructor.prototype;
         if (!prototype) continue;
-        for (const property of ["innerHTML", "outerHTML"]) {
-          const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+        for (let _index31 = 0, _items31 = I.list(["innerHTML", "outerHTML"]); _index31 < _items31.length; _index31++) {
+          const property = _items31[_index31];
+          const descriptor = I.Object.getOwnPropertyDescriptor(prototype, property);
           if (!descriptor || typeof descriptor.set !== "function") continue;
           installAccessor(prototype, property, {
             set: function iframeHTMLSetter(value) {
@@ -2752,69 +2965,78 @@
           });
         }
       }
-      for (const property of ["write", "writeln"]) wrapHTML(realm.Document.prototype, property, false);
+      for (let _index32 = 0, _items32 = I.list(["write", "writeln"]); _index32 < _items32.length; _index32++) {
+        const property = _items32[_index32];
+        wrapHTML(realm.Document.prototype, property, false);
+      }
     }
     // Observe the Document itself, including document-start before <html> exists.
-    if (doc && !observedIframeDocuments.has(doc)) {
-      observedIframeDocuments.add(doc);
-      const observer = Reflect.construct(observerApi.Constructor, [(mutations) => {
-        for (const mutation of mutations) {
-          for (const node of Reflect.apply(observerApi.addedNodes, mutation, [])) scanNodeForIframes(node);
+    if (doc && !I.WeakSethas(observedIframeDocuments, doc)) {
+      I.WeakSetadd(observedIframeDocuments, doc);
+      const observer = I.Reflect.construct(observerApi.Constructor, [(mutations) => {
+        for (let _index33 = 0, _items33 = I.list(mutations); _index33 < _items33.length; _index33++) {
+          const mutation = _items33[_index33];
+          for (let _index34 = 0, _items34 = I.list(I.Reflect.apply(observerApi.addedNodes, mutation, [])); _index34 < _items34.length; _index34++) {
+            const node = _items34[_index34];
+            scanNodeForIframes(node);
+          }
         }
       }]);
-      Reflect.apply(observerApi.observe, observer, [doc, { childList: true, subtree: true }]);
+      I.Reflect.apply(observerApi.observe, observer, [doc, { childList: true, subtree: true }]);
       scanNodeForIframes(doc);
     }
   }
 
-  function workerBootstrap(config, createZoneTools, patchTemporalOverrides) {
+  function workerBootstrap(config, createZoneTools, patchTemporalOverrides, captureIntrinsics) {
     "use strict";
+    const I = captureIntrinsics(self);
     const nativeToString = Function.prototype.toString;
-    const nativeNames = new WeakMap();
+    const nativeNames = I.newWeakMap();
     const mark = (fn, name, length) => {
-      nativeNames.set(fn, name);
+      I.WeakMapset(nativeNames, fn, name);
       try {
-        Object.defineProperty(fn, "name", { value: name, configurable: true });
-        if (Number.isInteger(length)) {
-          Object.defineProperty(fn, "length", { value: length, configurable: true });
+        I.Object.defineProperty(fn, "name", { value: name, configurable: true });
+        if (I.Number.isInteger(length)) {
+          I.Object.defineProperty(fn, "length", { value: length, configurable: true });
         }
       } catch (_) {}
       return fn;
     };
     Function.prototype.toString = mark({
       toString() {
-        const name = nativeNames.get(this);
+        const name = I.WeakMapget(nativeNames, this);
         return name ? "function " + name + "() { [native code] }" :
-          Reflect.apply(nativeToString, this, []);
+          I.Reflect.apply(nativeToString, this, []);
       },
     }.toString, "toString");
 
     patchTemporalOverrides(self, () => config.timezoneEnabled ? config.timezone : null,
       (target, property, method) => {
-        const descriptor = Object.getOwnPropertyDescriptor(target, property);
-        Object.defineProperty(target, property, {
+        const descriptor = I.Object.getOwnPropertyDescriptor(target, property);
+        I.Object.defineProperty(target, property, {
           ...descriptor, value: mark(method, property, descriptor.value.length),
         });
-      }, () => config.localeEnabled ? config.languages : null);
+      }, () => config.localeEnabled ? config.languages : null, I);
 
     const defaultLocales = (locales) =>
-      locales === undefined || (Array.isArray(locales) && locales.length === 0);
-    const languageList = Object.freeze(Array.from(config.languages));
+      locales === undefined || (I.Array.isArray(locales) && locales.length === 0);
+    const languageList = I.Object.freeze(I.Array.from(config.languages));
     const NavigatorConstructor =
       typeof WorkerNavigator === "function" ? WorkerNavigator :
         (typeof Navigator === "function" ? Navigator : null);
     if (config.localeEnabled && NavigatorConstructor) {
-      for (const property of ["language", "languages"]) {
-        const descriptor = Object.getOwnPropertyDescriptor(NavigatorConstructor.prototype, property);
+      for (let _index35 = 0, _items35 = I.list(["language", "languages"]); _index35 < _items35.length; _index35++) {
+        const property = _items35[_index35];
+        const descriptor = I.Object.getOwnPropertyDescriptor(NavigatorConstructor.prototype, property);
         if (!descriptor || typeof descriptor.get !== "function") continue;
         const nativeGet = descriptor.get;
-        const getter = mark({
+        const getter = mark(I.lookupGetter({
           get value() {
-            const nativeValue = Reflect.apply(nativeGet, this, []);
+            const nativeValue = I.Reflect.apply(nativeGet, this, []);
             return property === "language" ? config.language : languageList;
           },
-        }.__lookupGetter__("value"), "get " + property);
-        Object.defineProperty(NavigatorConstructor.prototype, property, {
+        }, "value"), "get " + property);
+        I.Object.defineProperty(NavigatorConstructor.prototype, property, {
           get: getter,
           configurable: descriptor.configurable,
           enumerable: descriptor.enumerable,
@@ -2825,34 +3047,35 @@
     const wrapIntl = (name, injectTimezone) => {
       const Native = Intl[name];
       if (typeof Native !== "function") return;
-      let Wrapped = function () {
-        const args = Array.prototype.slice.call(arguments);
+      let Wrapped = function (...args) {
+
         if (config.localeEnabled && defaultLocales(args[0])) args[0] = config.languages;
         if (injectTimezone && config.timezoneEnabled) {
           const options = args[1];
           if (options == null || options.timeZone === undefined) {
-            args[1] = Object.assign({}, options || {}, { timeZone: config.timezone });
+            args[1] = I.Object.assign({}, options || {}, { timeZone: config.timezone });
           }
         }
         const target = new.target && new.target !== Wrapped ? new.target : Native;
-        if (!new.target) return Reflect.apply(Native, this, args);
-        return Reflect.construct(Native, args, target);
+        if (!new.target) return I.Reflect.apply(Native, this, args);
+        return I.Reflect.construct(Native, args, target);
       };
       mark(Wrapped, name, Native.length);
-      Object.setPrototypeOf(Wrapped, Object.getPrototypeOf(Native));
-      for (const key of Reflect.ownKeys(Native)) {
+      I.Object.setPrototypeOf(Wrapped, I.Object.getPrototypeOf(Native));
+      for (let _index36 = 0, _items36 = I.list(I.Reflect.ownKeys(Native)); _index36 < _items36.length; _index36++) {
+        const key = _items36[_index36];
         if (key === "name" || key === "length" || key === "prototype") continue;
         try {
-          Object.defineProperty(Wrapped, key, Object.getOwnPropertyDescriptor(Native, key));
+          I.Object.defineProperty(Wrapped, key, I.Object.getOwnPropertyDescriptor(Native, key));
         } catch (_) {}
       }
-      Object.defineProperty(Wrapped, "prototype", {
+      I.Object.defineProperty(Wrapped, "prototype", {
         value: Native.prototype,
         writable: false,
         configurable: false,
       });
-      const constructorDescriptor = Object.getOwnPropertyDescriptor(Native.prototype, "constructor");
-      Object.defineProperty(Native.prototype, "constructor", {
+      const constructorDescriptor = I.Object.getOwnPropertyDescriptor(Native.prototype, "constructor");
+      I.Object.defineProperty(Native.prototype, "constructor", {
         value: Wrapped,
         writable: constructorDescriptor ? constructorDescriptor.writable : true,
         enumerable: constructorDescriptor ? constructorDescriptor.enumerable : false,
@@ -2860,22 +3083,28 @@
       });
       Intl[name] = Wrapped;
     };
-    for (const name of [
+    for (let _index37 = 0, _items37 = I.list([
       "Collator", "NumberFormat", "PluralRules", "RelativeTimeFormat",
       "ListFormat", "DisplayNames", "Segmenter", "DurationFormat",
-    ]) wrapIntl(name, false);
+    ]); _index37 < _items37.length; _index37++) {
+      const name = _items37[_index37];
+      wrapIntl(name, false);
+    }
 
     const NativeDateTimeFormat = Intl.DateTimeFormat;
     const NativeDate = Date;
     const nativeDateMethods = {};
-    for (const name of [
+    for (let _index38 = 0, _items38 = I.list([
       "getFullYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes",
       "getSeconds", "getMilliseconds", "getYear", "getTimezoneOffset", "toString",
       "toDateString", "toTimeString", "setHours", "setMinutes", "setSeconds", "setDate",
       "setMonth", "setFullYear", "setYear", "setTime",
-    ]) nativeDateMethods[name] = NativeDate.prototype[name];
+    ]); _index38 < _items38.length; _index38++) {
+      const name = _items38[_index38];
+      nativeDateMethods[name] = NativeDate.prototype[name];
+    }
     const tools = config.timezoneEnabled
-      ? createZoneTools(NativeDate, NativeDateTimeFormat, () => config.timezone)
+      ? createZoneTools(NativeDate, NativeDateTimeFormat, () => config.timezone, I)
       : null;
     wrapIntl("DateTimeFormat", true);
 
@@ -2885,11 +3114,12 @@
       getMilliseconds: "millisecond", getYear: "year",
     };
     if (tools) {
-      for (const property of Object.keys(getters)) {
+      for (let _index39 = 0, _items39 = I.list(I.Object.keys(getters)); _index39 < _items39.length; _index39++) {
+        const property = _items39[_index39];
         const nativeMethod = nativeDateMethods[property];
         const override = mark({
           [property]() {
-            const nativeValue = Reflect.apply(nativeMethod, this, []);
+            const nativeValue = I.Reflect.apply(nativeMethod, this, []);
             const value = tools.parts(this);
             if (!value) return nativeValue;
             const result = value[getters[property]];
@@ -2903,7 +3133,7 @@
       const nativeOffset = nativeDateMethods.getTimezoneOffset;
       NativeDate.prototype.getTimezoneOffset = mark({
         getTimezoneOffset() {
-          Reflect.apply(nativeOffset, this, []);
+          I.Reflect.apply(nativeOffset, this, []);
           return tools.timezoneOffset(tools.epoch(this));
         },
       }.getTimezoneOffset, "getTimezoneOffset");
@@ -2913,11 +3143,12 @@
         toDateString: tools.dateText,
         toTimeString: tools.timeText,
       };
-      for (const property of Object.keys(textMethods)) {
+      for (let _index40 = 0, _items40 = I.list(I.Object.keys(textMethods)); _index40 < _items40.length; _index40++) {
+        const property = _items40[_index40];
         const nativeMethod = nativeDateMethods[property];
         NativeDate.prototype[property] = mark({
           [property]() {
-            Reflect.apply(nativeMethod, this, []);
+            I.Reflect.apply(nativeMethod, this, []);
             return textMethods[property](this);
           },
         }[property], property, 0);
@@ -2927,92 +3158,94 @@
         const nativeMethod = nativeDateMethods[property];
         try {
           const timestamp = tools.epoch(receiver);
-          const item = Number.isFinite(timestamp)
+          const item = I.Number.isFinite(timestamp)
             ? tools.parts(receiver)
             : (property === "setFullYear" || property === "setYear"
               ? { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 }
               : null);
-          if (!item) return Reflect.apply(nativeMethod, receiver, args);
+          if (!item) return I.Reflect.apply(nativeMethod, receiver, args);
           const values = {
             year: item.year, month: item.month, day: item.day, hour: item.hour,
             minute: item.minute, second: item.second,
-            millisecond: Number.isFinite(timestamp) ? item.millisecond : 0,
+            millisecond: I.Number.isFinite(timestamp) ? item.millisecond : 0,
           };
           if (property === "setHours") {
-            values.hour = Number(args[0]);
-            if (args.length >= 2) values.minute = Number(args[1]);
-            if (args.length >= 3) values.second = Number(args[2]);
-            if (args.length >= 4) values.millisecond = Number(args[3]);
+            values.hour = I.NumberCtor(args[0]);
+            if (args.length >= 2) values.minute = I.NumberCtor(args[1]);
+            if (args.length >= 3) values.second = I.NumberCtor(args[2]);
+            if (args.length >= 4) values.millisecond = I.NumberCtor(args[3]);
           } else if (property === "setMinutes") {
-            values.minute = Number(args[0]);
-            if (args.length >= 2) values.second = Number(args[1]);
-            if (args.length >= 3) values.millisecond = Number(args[2]);
+            values.minute = I.NumberCtor(args[0]);
+            if (args.length >= 2) values.second = I.NumberCtor(args[1]);
+            if (args.length >= 3) values.millisecond = I.NumberCtor(args[2]);
           } else if (property === "setSeconds") {
-            values.second = Number(args[0]);
-            if (args.length >= 2) values.millisecond = Number(args[1]);
+            values.second = I.NumberCtor(args[0]);
+            if (args.length >= 2) values.millisecond = I.NumberCtor(args[1]);
           } else if (property === "setDate") {
-            values.day = Number(args[0]);
+            values.day = I.NumberCtor(args[0]);
           } else if (property === "setMonth") {
-            values.month = Number(args[0]) + 1;
-            if (args.length >= 2) values.day = Number(args[1]);
+            values.month = I.NumberCtor(args[0]) + 1;
+            if (args.length >= 2) values.day = I.NumberCtor(args[1]);
           } else if (property === "setFullYear") {
-            values.year = Number(args[0]);
-            if (args.length >= 2) values.month = Number(args[1]) + 1;
-            if (args.length >= 3) values.day = Number(args[2]);
+            values.year = I.NumberCtor(args[0]);
+            if (args.length >= 2) values.month = I.NumberCtor(args[1]) + 1;
+            if (args.length >= 3) values.day = I.NumberCtor(args[2]);
           } else if (property === "setYear") {
             values.year = tools.makeYear(args[0]);
           }
           const result = tools.wallToEpoch(values);
-          Reflect.apply(nativeDateMethods.setTime, receiver, [result]);
+          I.Reflect.apply(nativeDateMethods.setTime, receiver, [result]);
           return result;
         } catch (_) {
-          return Reflect.apply(nativeMethod, receiver, args);
+          return I.Reflect.apply(nativeMethod, receiver, args);
         }
       };
-      for (const property of [
+      for (let _index41 = 0, _items41 = I.list([
         "setHours", "setMinutes", "setSeconds", "setDate", "setMonth",
         "setFullYear", "setYear",
-      ]) {
+      ]); _index41 < _items41.length; _index41++) {
+        const property = _items41[_index41];
         if (typeof nativeDateMethods[property] !== "function") continue;
         NativeDate.prototype[property] = mark({
           [property]() {
-            return applySetter(property, this, Array.prototype.slice.call(arguments));
+            return applySetter(property, this, I.list(arguments));
           },
         }[property], property, nativeDateMethods[property].length);
       }
 
-      let WrappedDate = function Date() {
-        const args = Array.prototype.slice.call(arguments);
+      let WrappedDate = function Date(...args) {
+
         if (!new.target) return tools.fullText(new NativeDate());
         const target = new.target === WrappedDate ? NativeDate : new.target;
         if (args.length === 1) {
           return typeof args[0] === "string" && tools.isAmbiguous(args[0])
-            ? Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target)
-            : Reflect.construct(NativeDate, args, target);
+            ? I.Reflect.construct(NativeDate, [tools.parseLocal(args[0])], target)
+            : I.Reflect.construct(NativeDate, args, target);
         }
         if (args.length >= 2) {
           const timestamp = tools.wallToEpoch({
             year: tools.makeYear(args[0]),
-            month: Number(args[1]) + 1,
-            day: args.length > 2 ? Number(args[2]) : 1,
-            hour: args.length > 3 ? Number(args[3]) : 0,
-            minute: args.length > 4 ? Number(args[4]) : 0,
-            second: args.length > 5 ? Number(args[5]) : 0,
-            millisecond: args.length > 6 ? Number(args[6]) : 0,
+            month: I.NumberCtor(args[1]) + 1,
+            day: args.length > 2 ? I.NumberCtor(args[2]) : 1,
+            hour: args.length > 3 ? I.NumberCtor(args[3]) : 0,
+            minute: args.length > 4 ? I.NumberCtor(args[4]) : 0,
+            second: args.length > 5 ? I.NumberCtor(args[5]) : 0,
+            millisecond: args.length > 6 ? I.NumberCtor(args[6]) : 0,
           });
-          return Reflect.construct(NativeDate, [timestamp], target);
+          return I.Reflect.construct(NativeDate, [timestamp], target);
         }
-        return Reflect.construct(NativeDate, args, target);
+        return I.Reflect.construct(NativeDate, args, target);
       };
       mark(WrappedDate, "Date", NativeDate.length);
-      Object.setPrototypeOf(WrappedDate, Object.getPrototypeOf(NativeDate));
-      for (const key of Reflect.ownKeys(NativeDate)) {
+      I.Object.setPrototypeOf(WrappedDate, I.Object.getPrototypeOf(NativeDate));
+      for (let _index42 = 0, _items42 = I.list(I.Reflect.ownKeys(NativeDate)); _index42 < _items42.length; _index42++) {
+        const key = _items42[_index42];
         if (key === "name" || key === "length" || key === "prototype" || key === "parse") continue;
         try {
-          Object.defineProperty(WrappedDate, key, Object.getOwnPropertyDescriptor(NativeDate, key));
+          I.Object.defineProperty(WrappedDate, key, I.Object.getOwnPropertyDescriptor(NativeDate, key));
         } catch (_) {}
       }
-      Object.defineProperty(WrappedDate, "prototype", {
+      I.Object.defineProperty(WrappedDate, "prototype", {
         value: NativeDate.prototype,
         writable: false,
         configurable: false,
@@ -3020,17 +3253,17 @@
       const wrappedParse = mark({
         parse(value) {
           const source = typeof value === "string" ? value : "" + value;
-          return tools.isAmbiguous(source) ? tools.parseLocal(source) : NativeDate.parse(source);
+          return tools.isAmbiguous(source) ? tools.parseLocal(source) : I.dateParse(source);
         },
-      }.parse, "parse", NativeDate.parse.length);
-      Object.defineProperty(WrappedDate, "parse", {
+      }.parse, "parse", I.dateParse.length);
+      I.Object.defineProperty(WrappedDate, "parse", {
         value: wrappedParse,
         writable: true,
         configurable: true,
       });
       const dateConstructorDescriptor =
-        Object.getOwnPropertyDescriptor(NativeDate.prototype, "constructor");
-      Object.defineProperty(NativeDate.prototype, "constructor", {
+        I.Object.getOwnPropertyDescriptor(NativeDate.prototype, "constructor");
+      I.Object.defineProperty(NativeDate.prototype, "constructor", {
         value: WrappedDate,
         writable: dateConstructorDescriptor ? dateConstructorDescriptor.writable : true,
         enumerable: dateConstructorDescriptor ? dateConstructorDescriptor.enumerable : false,
@@ -3043,24 +3276,24 @@
       if (!target || typeof target[property] !== "function") return;
       const nativeMethod = target[property];
       target[property] = mark({
-        [property]() {
-          const args = Array.prototype.slice.call(arguments);
+        [property](...args) {
+
           if (config.localeEnabled && defaultLocales(args[localeIndex])) {
             args[localeIndex] = config.languages;
           }
           if (withTimezone && config.timezoneEnabled) {
             const options = args[optionsIndex];
             if (options == null || options.timeZone === undefined) {
-              args[optionsIndex] = Object.assign({}, options || {}, {
+              args[optionsIndex] = I.Object.assign({}, options || {}, {
                 timeZone: config.timezone,
               });
             }
           }
-          return Reflect.apply(nativeMethod, this, args);
+          return I.Reflect.apply(nativeMethod, this, args);
         },
       }[property], property, nativeMethod.length);
     };
-    localeMethod(Number.prototype, "toLocaleString", 0, 1, false);
+    localeMethod(I.Number.prototype, "toLocaleString", 0, 1, false);
     if (typeof BigInt === "function") localeMethod(BigInt.prototype, "toLocaleString", 0, 1, false);
     localeMethod(String.prototype, "localeCompare", 1, 2, false);
     localeMethod(String.prototype, "toLocaleUpperCase", 0, 1, false);
@@ -3073,10 +3306,9 @@
       const nativeImportScripts = importScripts;
       self.importScripts = mark({
         importScripts() {
-          const urls = Array.prototype.map.call(arguments, (url) =>
-            new URL(String(url), config.baseUrl).href
-          );
-          return Reflect.apply(nativeImportScripts, self, urls);
+          const urls = I.methods.map(arguments, (url) =>
+            new URL(I.StringCtor(url), config.baseUrl).href);
+          return I.Reflect.apply(nativeImportScripts, self, urls);
         },
       }.importScripts, "importScripts");
     }
@@ -3091,15 +3323,15 @@
       timezone: settings.timezone,
       baseUrl: baseUrl || location.href,
     };
-    return "(" + callOriginalToString(workerBootstrap) + ")(" + JSON.stringify(config) + ", " +
-      callOriginalToString(createZoneTools) + ", " + callOriginalToString(patchTemporalOverrides) + ");";
+    return "(" + callOriginalToString(workerBootstrap) + ")(" + I.JSON.stringify(config) + ", " +
+      callOriginalToString(createZoneTools) + ", " + callOriginalToString(patchTemporalOverrides) + ", " + callOriginalToString(captureIntrinsics) + ");";
   }
 
   function decodeDataWorker(url) {
-    const match = /^data:([^,]*?),(.*)$/s.exec(url);
+    const match = I.methods.exec(/^data:([^,]*?),(.*)$/s, url);
     if (!match) return null;
     try {
-      return /;base64(?:;|$)/i.test(match[1])
+      return I.methods.test(/;base64(?:;|$)/i, match[1])
         ? decodeURIComponent(escape(atob(match[2])))
         : decodeURIComponent(match[2]);
     } catch (_) {
@@ -3116,42 +3348,44 @@
     const nativeRevokeObjectURL = NativeURL.revokeObjectURL;
 
     installOverride(NativeURL, "createObjectURL", function createObjectURL(value) {
-      const url = Reflect.apply(nativeCreateObjectURL, NativeURL, [value]);
-      if (value instanceof NativeBlob) trackedWorkerBlobs.set(url, value);
+      const url = I.Reflect.apply(nativeCreateObjectURL, NativeURL, [value]);
+      if (value instanceof NativeBlob) I.Mapset(trackedWorkerBlobs, url, value);
       return url;
     }, 1);
     installOverride(NativeURL, "revokeObjectURL", function revokeObjectURL(url) {
-      const rawUrl = String(url);
-      const result = Reflect.apply(nativeRevokeObjectURL, NativeURL, [rawUrl]);
-      trackedWorkerBlobs.delete(rawUrl);
-      const patched = sharedWorkerUrls.get(rawUrl);
+      const rawUrl = I.StringCtor(url);
+      const result = I.Reflect.apply(nativeRevokeObjectURL, NativeURL, [rawUrl]);
+      I.Mapdelete(trackedWorkerBlobs, rawUrl);
+      const patched = I.Mapget(sharedWorkerUrls, rawUrl);
       if (patched) {
-        Reflect.apply(nativeRevokeObjectURL, NativeURL, [patched]);
-        sharedWorkerUrls.delete(rawUrl);
+        I.Reflect.apply(nativeRevokeObjectURL, NativeURL, [patched]);
+        I.Mapdelete(sharedWorkerUrls, rawUrl);
       }
       return result;
     }, 1);
 
-    for (const property of ["Worker", "SharedWorker"]) {
+    for (let _index43 = 0, _items43 = I.list(["Worker", "SharedWorker"]); _index43 < _items43.length; _index43++) {
+      const property = _items43[_index43];
       const NativeWorker = realm[property];
       if (typeof NativeWorker !== "function") continue;
       const shared = property === "SharedWorker";
-      const WrappedWorker = function (scriptURL, options) {
-        if (!new.target) return Reflect.apply(NativeWorker, this, arguments);
-        const originalArgs = Array.prototype.slice.call(arguments);
-        const args = originalArgs.slice();
+      const WrappedWorker = function (...originalArgs) {
+        if (!new.target) return I.Reflect.apply(NativeWorker, this, arguments);
+        const scriptURL = originalArgs[0];
+        const options = originalArgs[1];
+        const args = I.methods.slice(originalArgs);
         const target = new.target === WrappedWorker ? NativeWorker : new.target;
-        const construct = () => Reflect.construct(NativeWorker, originalArgs, target);
+        const construct = () => I.Reflect.construct(NativeWorker, originalArgs, target);
         const constructPatched = () => {
           let optionGetterThrew = false;
-          const patchedArgs = args.slice();
+          const patchedArgs = I.methods.slice(args);
           if (args[1] && (typeof args[1] === "object" || typeof args[1] === "function")) {
-            patchedArgs[1] = new Proxy(args[1], { get(object, key) {
-              try { return Reflect.get(object, key, object); }
+            patchedArgs[1] = new I.Proxy(args[1], { get(object, key) {
+              try { return I.Reflect.get(object, key, object); }
               catch (error) { optionGetterThrew = true; throw error; }
             } });
           }
-          try { return Reflect.construct(NativeWorker, patchedArgs, target); }
+          try { return I.Reflect.construct(NativeWorker, patchedArgs, target); }
           catch (error) {
             // A generated Blob URL is a string, not the page's TrustedScriptURL.
             // Fall back only for the native TT sink rejection, not arbitrary
@@ -3160,7 +3394,7 @@
             // getter read must not disable fallback; only a thrown getter does.
             // Retrying original arguments can read those getters a second time.
             if (!optionGetterThrew && realm.trustedTypes && error instanceof realm.TypeError &&
-              /TrustedScriptURL/.test(error.message)) return construct();
+              I.methods.test(/TrustedScriptURL/, error.message)) return construct();
             throw error;
           }
         };
@@ -3168,21 +3402,21 @@
           (!settings.localeEnabled && !settings.timezoneEnabled)) return construct();
         // Pass-through paths retain the original object and options untouched.
         if (!settings.patchUrlWorkers && typeof scriptURL !== "string") return construct();
-        const rawUrl = String(scriptURL);
-        if (!settings.patchUrlWorkers && !rawUrl.startsWith("blob:") && !rawUrl.startsWith("data:")) {
+        const rawUrl = I.StringCtor(scriptURL);
+        if (!settings.patchUrlWorkers && !I.methods.startsWith(rawUrl, "blob:") && !I.methods.startsWith(rawUrl, "data:")) {
           return construct();
         }
         const cacheKey = new NativeURL(rawUrl, realm.location.href).href;
-        if (shared && sharedWorkerUrls.has(cacheKey)) {
-          args[0] = sharedWorkerUrls.get(cacheKey);
+        if (shared && I.Maphas(sharedWorkerUrls, cacheKey)) {
+          args[0] = I.Mapget(sharedWorkerUrls, cacheKey);
           return constructPatched();
         }
         let parts;
-        if (rawUrl.startsWith("blob:")) {
-          const blob = trackedWorkerBlobs.get(rawUrl);
+        if (I.methods.startsWith(rawUrl, "blob:")) {
+          const blob = I.Mapget(trackedWorkerBlobs, rawUrl);
           if (!blob) return construct();
           parts = [buildWorkerPayload(realm.location.href), "\n", blob];
-        } else if (rawUrl.startsWith("data:")) {
+        } else if (I.methods.startsWith(rawUrl, "data:")) {
           const source = decodeDataWorker(rawUrl);
           if (source == null) return construct();
           parts = [buildWorkerPayload(realm.location.href), "\n", source];
@@ -3192,8 +3426,8 @@
           // a page's getter twice. SharedWorker's string-name overload stays intact.
           const type = options && options.type;
           if (options && typeof options === "object") {
-            args[1] = new Proxy(options, { get(object, key) {
-              return key === "type" ? type : Reflect.get(object, key, object);
+            args[1] = new I.Proxy(options, { get(object, key) {
+              return key === "type" ? type : I.Reflect.get(object, key, object);
             } });
           }
           const payload = buildWorkerPayload(absoluteUrl);
@@ -3201,39 +3435,39 @@
             // Static dependencies execute in source order. A separate first
             // dependency installs the mask before the original module (and its
             // dependencies). Dynamic import can miss SharedWorker connect events.
-            const prelude = Reflect.apply(nativeCreateObjectURL, NativeURL,
+            const prelude = I.Reflect.apply(nativeCreateObjectURL, NativeURL,
               [new NativeBlob([payload], { type: "text/javascript" })]);
-            parts = ["import " + JSON.stringify(prelude) + ";\nimport " + JSON.stringify(absoluteUrl) + ";"];
+            parts = ["import " + I.JSON.stringify(prelude) + ";\nimport " + I.JSON.stringify(absoluteUrl) + ";"];
           } else {
-            parts = [payload, "\nimportScripts(" + JSON.stringify(absoluteUrl) + ");"];
+            parts = [payload, "\nimportScripts(" + I.JSON.stringify(absoluteUrl) + ");"];
           }
         } else return construct();
 
         // Reuse the wrapper URL: SharedWorker identity is (URL, name). A fresh
         // Blob URL per call would silently create separate workers or throw.
         const blob = new NativeBlob(parts, { type: "text/javascript" });
-        const patched = Reflect.apply(nativeCreateObjectURL, NativeURL, [blob]);
-        if (shared) sharedWorkerUrls.set(cacheKey, patched);
+        const patched = I.Reflect.apply(nativeCreateObjectURL, NativeURL, [blob]);
+        if (shared) I.Mapset(sharedWorkerUrls, cacheKey, patched);
         args[0] = patched;
         return constructPatched();
       };
       registerOverride(WrappedWorker, property);
       disguiseAsNative(WrappedWorker, property, NativeWorker.length);
-      Object.setPrototypeOf(WrappedWorker, Object.getPrototypeOf(NativeWorker));
-      Object.defineProperty(WrappedWorker, "prototype", { value: NativeWorker.prototype,
+      I.Object.setPrototypeOf(WrappedWorker, I.Object.getPrototypeOf(NativeWorker));
+      I.Object.defineProperty(WrappedWorker, "prototype", { value: NativeWorker.prototype,
         writable: false, enumerable: false, configurable: false });
-      const constructorDescriptor = Object.getOwnPropertyDescriptor(NativeWorker.prototype, "constructor");
-      Object.defineProperty(NativeWorker.prototype, "constructor", {
+      const constructorDescriptor = I.Object.getOwnPropertyDescriptor(NativeWorker.prototype, "constructor");
+      I.Object.defineProperty(NativeWorker.prototype, "constructor", {
         ...constructorDescriptor, value: WrappedWorker,
       });
-      const descriptor = Object.getOwnPropertyDescriptor(realm, property);
-      Object.defineProperty(realm, property, { ...descriptor, value: WrappedWorker });
+      const descriptor = I.Object.getOwnPropertyDescriptor(realm, property);
+      I.Object.defineProperty(realm, property, { ...descriptor, value: WrappedWorker });
     }
   }
 
   function element(tag, properties) {
     const node = document.createElement(tag);
-    if (properties) Object.assign(node, properties);
+    if (properties) I.Object.assign(node, properties);
     return node;
   }
 
@@ -3249,7 +3483,7 @@
 
     const host = element("div");
     host.setAttribute("data-vlm-panel-host", VERSION);
-    Object.assign(host.style, {
+    I.Object.assign(host.style, {
       all: "initial",
       position: "fixed",
       inset: "0",
@@ -3408,21 +3642,17 @@
     const renderProfiles = () => {
       const selected = byId("profileSelect").value;
       byId("profileSelect").replaceChildren(new Option("请选择", ""));
-      workingProfiles.forEach((profile, index) => {
-        byId("profileSelect").appendChild(new Option(profile.name, String(index)));
+      I.methods.forEach(workingProfiles, (profile, index) => {
+        byId("profileSelect").appendChild(new Option(profile.name, I.StringCtor(index)));
       });
-      if (workingProfiles[Number(selected)]) byId("profileSelect").value = selected;
+      if (workingProfiles[I.NumberCtor(selected)]) byId("profileSelect").value = selected;
     };
     const updateScopePreview = () => {
       const mode = byId("siteMode").value;
-      const patterns = byId("sitePatterns").value
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter(Boolean);
-      const invalid = patterns.filter((value) => !parseSitePattern(value));
-      const matchedPatterns = patterns.filter((value) =>
-        sitePatternMatches(value, location.href)
-      );
+      const patterns = I.methods.filter(I.methods.map(I.methods.split(byId("sitePatterns").value, /\r?\n/), (value) => I.methods.trim(value)), I.BooleanCtor);
+      const invalid = I.methods.filter(patterns, (value) => !parseSitePattern(value));
+      const matchedPatterns = I.methods.filter(patterns, (value) =>
+        sitePatternMatches(value, location.href));
       const matched = matchedPatterns.length > 0;
       const active = byId("enabled").checked &&
         (mode === "all" || (mode === "allowlist" ? matched : !matched));
@@ -3430,30 +3660,30 @@
       if (mode === "all" && patterns.length) {
         preview += "；所有网站模式下，规则列表暂不参与判断";
       } else if (matchedPatterns.length) {
-        preview += "；匹配规则：" + matchedPatterns.join("、");
+        preview += "；匹配规则：" + I.methods.join(matchedPatterns, "、");
       }
       preview += "；共 " + patterns.length + " 条规则";
       byId("scopePreview").textContent = invalid.length
-        ? "无效规则：" + invalid.join("、")
+        ? "无效规则：" + I.methods.join(invalid, "、")
         : preview;
       byId("scopePreview").style.color = invalid.length ? "#fca5a5" : "#bfdbfe";
       const features = ["定位"];
-      if (byId("timezoneEnabled").checked) features.push("时区");
-      if (byId("localeEnabled").checked) features.push("实验性语言");
-      if (byId("workerEnabled").checked) features.push("Worker");
+      if (byId("timezoneEnabled").checked) I.methods.push(features, "时区");
+      if (byId("localeEnabled").checked) I.methods.push(features, "实验性语言");
+      if (byId("workerEnabled").checked) I.methods.push(features, "Worker");
       byId("currentStatus").textContent = active
-        ? "当前保护状态：已启用（" + features.join("、") + "）"
+        ? "当前保护状态：已启用（" + I.methods.join(features, "、") + "）"
         : "当前保护状态：未启用；请检查总开关和网站范围。";
       byId("currentStatus").style.color = active ? "#86efac" : "#fbbf24";
     };
     const updatePrecisionPreview = () => {
       const enabled = byId("approximateEnabled").checked;
-      const radius = Number(byId("approximateRadius").value);
+      const radius = I.NumberCtor(byId("approximateRadius").value);
       byId("approximateRadius").disabled = !enabled;
       byId("regenerateApproximate").disabled = !enabled;
-      const latitude = Number(byId("latitude").value);
-      const longitude = Number(byId("longitude").value);
-      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      const latitude = I.NumberCtor(byId("latitude").value);
+      const longitude = I.NumberCtor(byId("longitude").value);
+      if (!I.Number.isFinite(latitude) || !I.Number.isFinite(longitude)) {
         byId("precisionPreview").textContent = "请先填写有效的纬度和经度。";
         return;
       }
@@ -3465,8 +3695,8 @@
         workingApproximateSeed
       );
       byId("precisionPreview").textContent = enabled
-        ? "网页将稳定收到：" + reported.latitude.toFixed(8) + ", " +
-          reported.longitude.toFixed(8) + "（位于锚点半径内）"
+        ? "网页将稳定收到：" + I.methods.toFixed(reported.latitude, 8) + ", " +
+          I.methods.toFixed(reported.longitude, 8) + "（位于锚点半径内）"
         : "网页将收到所填锚点坐标；低位仍会做原生外观填充。";
     };
     const applyParsedCoordinates = (source) => {
@@ -3476,8 +3706,8 @@
         byId("error").textContent = "无法识别坐标。请使用十进制、DMS、Geohash 或包含坐标的地图链接。";
         return false;
       }
-      byId("latitude").value = String(Number(parsed.latitude.toFixed(8)));
-      byId("longitude").value = String(Number(parsed.longitude.toFixed(8)));
+      byId("latitude").value = I.StringCtor(I.NumberCtor(I.methods.toFixed(parsed.latitude, 8)));
+      byId("longitude").value = I.StringCtor(I.NumberCtor(I.methods.toFixed(parsed.longitude, 8)));
       updatePrecisionPreview();
       byId("error").style.color = "#86efac";
       byId("error").textContent = "已解析坐标；保存并刷新后生效。";
@@ -3487,19 +3717,19 @@
       const network = readNetworkState();
       const parts = [];
       if (network.lastSyncAt) {
-        parts.push("上次同步：" + new Date(network.lastSyncAt).toLocaleString());
-        if (network.lastSyncLabel) parts.push(network.lastSyncLabel);
-        if (network.lastIp) parts.push(network.lastIp);
+        I.methods.push(parts, "上次同步：" + new Date(network.lastSyncAt).toLocaleString());
+        if (network.lastSyncLabel) I.methods.push(parts, network.lastSyncLabel);
+        if (network.lastIp) I.methods.push(parts, network.lastIp);
       } else {
-        parts.push("尚未同步 VPN 出口");
+        I.methods.push(parts, "尚未同步 VPN 出口");
       }
-      if (network.lastError) parts.push("上次错误：" + network.lastError);
-      byId("vpnStatus").textContent = parts.join("；");
+      if (network.lastError) I.methods.push(parts, "上次错误：" + network.lastError);
+      byId("vpnStatus").textContent = I.methods.join(parts, "；");
       byId("vpnCheckMinutes").disabled = !byId("vpnAutoSync").checked;
     };
     const applyTimezoneForFormCoordinates = async (label) => {
-      const latitude = Number(byId("latitude").value);
-      const longitude = Number(byId("longitude").value);
+      const latitude = I.NumberCtor(byId("latitude").value);
+      const longitude = I.NumberCtor(byId("longitude").value);
       if (!validCoordinates(latitude, longitude)) {
         throw new Error("请先填写有效坐标。");
       }
@@ -3519,7 +3749,8 @@
         container.appendChild(empty);
         return;
       }
-      for (const [index, result] of results.entries()) {
+      for (let index = 0; index < results.length; index++) {
+        const result = results[index];
         const button = element("button", {
           id: "cityResult" + index,
           type: "button",
@@ -3527,11 +3758,11 @@
           textContent: result.name,
         });
         button.addEventListener("click", async () => {
-          byId("latitude").value = String(result.latitude);
-          byId("longitude").value = String(result.longitude);
+          byId("latitude").value = I.StringCtor(result.latitude);
+          byId("longitude").value = I.StringCtor(result.longitude);
           byId("coordinateText").value = result.latitude + ", " + result.longitude;
-          byId("profileName").value = [result.city, result.country].filter(Boolean).join(", ") ||
-            result.name.slice(0, 40);
+          byId("profileName").value = I.methods.join(I.methods.filter([result.city, result.country], I.BooleanCtor), ", ") ||
+            I.methods.slice(result.name, 0, 40);
           updatePrecisionPreview();
           if (result.timezone) {
             byId("timezone").value = result.timezone;
@@ -3560,28 +3791,28 @@
     };
     const fillForm = (value) => {
       byId("enabled").checked = value.enabled;
-      byId("latitude").value = String(value.latitude);
-      byId("longitude").value = String(value.longitude);
-      byId("accuracy").value = String(value.accuracy);
+      byId("latitude").value = I.StringCtor(value.latitude);
+      byId("longitude").value = I.StringCtor(value.longitude);
+      byId("accuracy").value = I.StringCtor(value.accuracy);
       byId("approximateEnabled").checked = value.approximateEnabled;
-      byId("approximateRadius").value = String(value.approximateRadius);
+      byId("approximateRadius").value = I.StringCtor(value.approximateRadius);
       workingApproximateSeed = value.approximateSeed > 0
         ? value.approximateSeed
         : randomSeed();
       byId("prompt").checked = value.preservePermissionPrompt;
       byId("localeEnabled").checked = value.localeEnabled;
       byId("language").value = value.language;
-      byId("languages").value = value.languages.join(", ");
+      byId("languages").value = I.methods.join(value.languages, ", ");
       byId("timezoneEnabled").checked = value.timezoneEnabled;
       byId("timezone").value = value.timezone;
       byId("workerEnabled").checked = value.workerEnabled;
       byId("patchUrlWorkers").checked = value.patchUrlWorkers;
       byId("siteMode").value = value.siteMode;
-      byId("sitePatterns").value = value.sitePatterns.join("\n");
+      byId("sitePatterns").value = I.methods.join(value.sitePatterns, "\n");
       byId("vpnAutoSync").checked = value.vpnAutoSync;
-      byId("vpnCheckMinutes").value = String(value.vpnCheckMinutes);
+      byId("vpnCheckMinutes").value = I.StringCtor(value.vpnCheckMinutes);
       byId("floatingButtonEnabled").checked = value.floatingButtonEnabled;
-      workingProfiles = value.profiles.map((profile) => ({ ...profile }));
+      workingProfiles = I.methods.map(value.profiles, (profile) => ({ ...profile }));
       renderProfiles();
       byId("debug").checked = value.debug;
       updatePrecisionPreview();
@@ -3592,13 +3823,15 @@
 
     const close = () => host.remove();
     byId("cancel").addEventListener("click", close);
-    for (const id of [
+    for (let _index44 = 0, _items44 = I.list([
       "enabled", "siteMode", "sitePatterns", "timezoneEnabled", "localeEnabled", "workerEnabled",
-    ]) {
+    ]); _index44 < _items44.length; _index44++) {
+      const id = _items44[_index44];
       byId(id).addEventListener("input", updateScopePreview);
       byId(id).addEventListener("change", updateScopePreview);
     }
-    for (const id of ["latitude", "longitude", "approximateEnabled", "approximateRadius"]) {
+    for (let _index45 = 0, _items45 = I.list(["latitude", "longitude", "approximateEnabled", "approximateRadius"]); _index45 < _items45.length; _index45++) {
+      const id = _items45[_index45];
       byId(id).addEventListener("input", updatePrecisionPreview);
       byId(id).addEventListener("change", updatePrecisionPreview);
     }
@@ -3653,13 +3886,13 @@
         applyVpnLocation(result);
         byId("error").style.color = "#86efac";
         byId("error").textContent = "已同步到 " +
-          ([result.city, result.country].filter(Boolean).join(", ") || result.ip) +
+          (I.methods.join(I.methods.filter([result.city, result.country], I.BooleanCtor), ", ") || result.ip) +
           "；即将刷新页面。";
         updateVpnStatus();
         setTimeout(() => location.reload(), 700);
       } catch (error) {
         const network = readNetworkState();
-        network.lastError = String(error && error.message || error).slice(0, 500);
+        network.lastError = I.methods.slice(I.StringCtor(error && error.message || error), 0, 500);
         saveNetworkState(network);
         updateVpnStatus();
         byId("error").style.color = "#fca5a5";
@@ -3673,7 +3906,8 @@
         applyParsedCoordinates(byId("coordinateText").value);
       }
     });
-    for (const id of ["latitude", "longitude"]) {
+    for (let _index46 = 0, _items46 = I.list(["latitude", "longitude"]); _index46 < _items46.length; _index46++) {
+      const id = _items46[_index46];
       byId(id).addEventListener("paste", (event) => {
         const pasted = event.clipboardData && event.clipboardData.getData("text");
         if (pasted && applyParsedCoordinates(pasted)) event.preventDefault();
@@ -3692,14 +3926,11 @@
         byId("error").textContent = "当前页面不是 HTTP/HTTPS 网站，无法生成网站规则。";
         return;
       }
-      const patterns = byId("sitePatterns").value
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter(Boolean);
-      const exists = patterns.some((value) => value.toLowerCase() === rule.toLowerCase());
+      const patterns = I.methods.filter(I.methods.map(I.methods.split(byId("sitePatterns").value, /\r?\n/), (value) => I.methods.trim(value)), I.BooleanCtor);
+      const exists = I.methods.some(patterns, (value) => I.methods.toLowerCase(value) === I.methods.toLowerCase(rule));
       if (!exists) {
-        patterns.push(rule);
-        byId("sitePatterns").value = patterns.join("\n");
+        I.methods.push(patterns, rule);
+        byId("sitePatterns").value = I.methods.join(patterns, "\n");
       }
       updateScopePreview();
       byId("error").style.color = "#86efac";
@@ -3708,16 +3939,16 @@
         : "已添加当前网站：" + rule + "。应用模式未改变，保存并刷新后生效。";
     });
     byId("loadProfile").addEventListener("click", () => {
-      const profile = workingProfiles[Number(byId("profileSelect").value)];
+      const profile = workingProfiles[I.NumberCtor(byId("profileSelect").value)];
       if (!profile) {
         byId("error").textContent = "请先选择配置档。";
         return;
       }
-      byId("latitude").value = String(profile.latitude);
-      byId("longitude").value = String(profile.longitude);
-      byId("accuracy").value = String(profile.accuracy);
+      byId("latitude").value = I.StringCtor(profile.latitude);
+      byId("longitude").value = I.StringCtor(profile.longitude);
+      byId("accuracy").value = I.StringCtor(profile.accuracy);
       byId("language").value = profile.language;
-      byId("languages").value = profile.languages.join(", ");
+      byId("languages").value = I.methods.join(profile.languages, ", ");
       byId("timezone").value = profile.timezone;
       byId("profileName").value = profile.name;
       updatePrecisionPreview();
@@ -3725,7 +3956,7 @@
       byId("error").textContent = "已载入“" + profile.name + "”，点击保存并刷新后生效。";
     });
     byId("saveProfile").addEventListener("click", () => {
-      const name = byId("profileName").value.trim();
+      const name = I.methods.trim(byId("profileName").value);
       if (!name) {
         byId("error").textContent = "请填写配置档名称。";
         return;
@@ -3743,27 +3974,27 @@
         byId("error").textContent = "当前地点资料无法保存。";
         return;
       }
-      const existing = workingProfiles.findIndex((item) => item.name === profile.name);
-      if (existing === -1) workingProfiles.push(profile);
+      const existing = I.methods.findIndex(workingProfiles, (item) => item.name === profile.name);
+      if (existing === -1) I.methods.push(workingProfiles, profile);
       else workingProfiles[existing] = profile;
       renderProfiles();
-      byId("profileSelect").value = String(existing === -1 ? workingProfiles.length - 1 : existing);
+      byId("profileSelect").value = I.StringCtor(existing === -1 ? workingProfiles.length - 1 : existing);
       byId("error").style.color = "#86efac";
       byId("error").textContent = "配置档已加入表单，请点击保存并刷新以写入存储。";
     });
     byId("deleteProfile").addEventListener("click", () => {
-      const index = Number(byId("profileSelect").value);
+      const index = I.NumberCtor(byId("profileSelect").value);
       if (!workingProfiles[index]) {
         byId("error").textContent = "请先选择配置档。";
         return;
       }
-      const removed = workingProfiles.splice(index, 1)[0];
+      const removed = I.methods.splice(workingProfiles, index, 1)[0];
       renderProfiles();
       byId("error").style.color = "#86efac";
       byId("error").textContent = "已从表单删除“" + removed.name + "”，保存并刷新后生效。";
     });
     byId("exportConfig").addEventListener("click", async () => {
-      const exported = JSON.stringify({
+      const exported = I.JSON.stringify({
         schema: 7,
         settings: { ...settings, profiles: workingProfiles },
       }, null, 2);
@@ -3780,7 +4011,7 @@
     });
     byId("importConfig").addEventListener("click", () => {
       try {
-        const parsed = JSON.parse(byId("configText").value);
+        const parsed = I.JSON.parse(byId("configText").value);
         const imported = validateSettings(parsed && parsed.settings ? parsed.settings : parsed);
         fillForm(imported);
         byId("error").style.color = "#86efac";
@@ -3795,31 +4026,28 @@
     });
     shadow.querySelector("form").addEventListener("submit", (event) => {
       event.preventDefault();
-      const latitude = Number(byId("latitude").value);
-      const longitude = Number(byId("longitude").value);
-      const accuracy = Number(byId("accuracy").value);
-      const approximateRadius = Number(byId("approximateRadius").value);
-      const language = byId("language").value.trim();
-      const languages = byId("languages").value.split(/[,，\s]+/).filter(Boolean);
-      const timezone = byId("timezone").value.trim();
+      const latitude = I.NumberCtor(byId("latitude").value);
+      const longitude = I.NumberCtor(byId("longitude").value);
+      const accuracy = I.NumberCtor(byId("accuracy").value);
+      const approximateRadius = I.NumberCtor(byId("approximateRadius").value);
+      const language = I.methods.trim(byId("language").value);
+      const languages = I.methods.filter(I.methods.split(byId("languages").value, /[,，\s]+/), I.BooleanCtor);
+      const timezone = I.methods.trim(byId("timezone").value);
       const siteMode = byId("siteMode").value;
-      const sitePatterns = byId("sitePatterns").value
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter(Boolean);
-      if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+      const sitePatterns = I.methods.filter(I.methods.map(I.methods.split(byId("sitePatterns").value, /\r?\n/), (value) => I.methods.trim(value)), I.BooleanCtor);
+      if (!I.Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
         byId("error").textContent = "纬度必须在 -90 到 90 之间。";
         return;
       }
-      if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      if (!I.Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
         byId("error").textContent = "经度必须在 -180 到 180 之间。";
         return;
       }
-      if (!Number.isFinite(accuracy) || accuracy < 1 || accuracy > 100000) {
+      if (!I.Number.isFinite(accuracy) || accuracy < 1 || accuracy > 100000) {
         byId("error").textContent = "定位精度必须在 1 到 100000 米之间。";
         return;
       }
-      if (!Number.isFinite(approximateRadius) ||
+      if (!I.Number.isFinite(approximateRadius) ||
           approximateRadius < 50 || approximateRadius > 50000) {
         byId("error").textContent = "近似位置半径必须在 50 到 50000 米之间。";
         return;
@@ -3837,9 +4065,9 @@
         byId("error").textContent = "时区标识无效，例如应填写 Asia/Taipei。";
         return;
       }
-      const invalidPatterns = sitePatterns.filter((value) => !parseSitePattern(value));
+      const invalidPatterns = I.methods.filter(sitePatterns, (value) => !parseSitePattern(value));
       if (invalidPatterns.length) {
-        byId("error").textContent = "网站规则无效：" + invalidPatterns.join("、");
+        byId("error").textContent = "网站规则无效：" + I.methods.join(invalidPatterns, "、");
         return;
       }
       saveSettings({
@@ -3862,7 +4090,7 @@
         sitePatterns,
         profiles: workingProfiles,
         vpnAutoSync: byId("vpnAutoSync").checked,
-        vpnCheckMinutes: Number(byId("vpnCheckMinutes").value),
+        vpnCheckMinutes: I.NumberCtor(byId("vpnCheckMinutes").value),
         floatingButtonEnabled: byId("floatingButtonEnabled").checked,
         debug: byId("debug").checked,
       });
@@ -3883,7 +4111,7 @@
       if (document.querySelector("[data-vlm-fab-host]")) return;
       const host = element("div");
       host.setAttribute("data-vlm-fab-host", VERSION);
-      Object.assign(host.style, {
+      I.Object.assign(host.style, {
         all: "initial",
         position: "fixed",
         right: "max(14px, env(safe-area-inset-right))",
@@ -3930,7 +4158,7 @@
           document.querySelector("[data-vlm-onboarding-host]")) return;
       const host = element("div");
       host.setAttribute("data-vlm-onboarding-host", VERSION);
-      Object.assign(host.style, {
+      I.Object.assign(host.style, {
         all: "initial",
         position: "fixed",
         inset: "0",
@@ -3995,7 +4223,7 @@
     // An ancestor's instance patched this realm, but wrappers this instance
     // installs below (iframe coverage) live in this registry: layer a mask
     // that names them and defers everything else to the ancestor's mask.
-    patchedRealms.add(Function.prototype);
+    I.WeakSetadd(patchedRealms, Function.prototype);
     installFunctionMaskingOn(window);
   }
   installIframeCoverage(window);

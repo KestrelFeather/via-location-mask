@@ -51,6 +51,15 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.8 修复
+
+- 在窗口脚本及 Worker 启动时建立私有内置函数快照，统一保存反射、Object/Array/Number/Math/JSON、集合操作及运行路径所需的原型方法。函数伪装表使用保存的 WeakMap 方法，网页替换 `WeakMap.prototype.get` 不再使 Date、定位等包装函数暴露源码。
+- 包装器改用保存的 `Reflect.apply/construct/get` 等入口；参数收集使用剩余参数或按下标复制，移除 `Array.prototype.slice.call(arguments)`。数组、NodeList 和内部集合不再通过网页可替换的迭代器遍历，NodeList/HTMLCollection 长度使用保存的原生 getter。
+- 日期、定位、DOM 插入、网站规则及 Worker 的运行路径共用上述调用方式；内部正则还隔离 String 方法隐式使用的 `RegExp.exec` 和 Symbol 方法，避免只保存外层函数仍被间接挂钩。
+- 新增内置函数挂钩测试，同时验证“记录调用”和“直接抛错”，覆盖主页面、嵌套 iframe、Worker 与 SharedWorker，以及允许列表、日期换算、定位监听和新建 Worker。
+
+Edge 157.0.4341.46：新增 8/8 组、既有 105/105 组回归通过。测试中的挂钩计数及截获内部函数数均为 0；同一套新增测试在 v1.0.7 上有 7 组失败。快照只能保存安装时实际可见的引用，不能恢复更早已经被替换的函数，也不代表所有指纹检测渠道均已消除。详见 [测试说明](tests/README.md)。
+
 ## v1.0.7 修复
 
 - 修复 URL Worker 实验选项开启时，带选项对象的 TrustedScriptURL 无法回退：改为记录选项 getter 是否抛错，而非是否被读取，兼容 Chromium 先转换选项再校验 Trusted Types 的顺序。覆盖 Worker/SharedWorker、URL/Blob，以及空选项、classic/module 类型和名称选项。
