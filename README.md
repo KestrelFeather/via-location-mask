@@ -51,6 +51,13 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.9 修复
+
+- 启动时保存 `setTimeout`、`clearTimeout`、`queueMicrotask` 并绑定安装时的全局对象，同时保存 Promise 构造器和带正确接收者的 `Promise.resolve`。定位首次投递、缓存投递、监听续订/取消及权限查询不再调用网页后续替换的这些入口，也不再通过它们泄漏内部回调。
+- Date 的三个 `toLocale*`、`Intl.DateTimeFormat` 和 `Temporal.Instant#toLocaleString` 共用时区选项代理，Worker/SharedWorker 使用同一实现。原生格式化逐项读取原始选项，只在读到 `timeZone: undefined` 时替换，保留继承/不可枚举属性、冻结对象、getter 接收者/次数/顺序及原生参数错误。
+
+Edge 157.0.4341.46：扩展的内置函数回归 8/8、新增原生格式化对照 4/4、既有四套 105/105，总计 117 组通过。对照覆盖主页面、嵌套 iframe、Worker 和 SharedWorker；真实东京时区与伪装为东京的纽约时区结果一致。详见 [测试说明](tests/README.md)，尚未做 Via/Android 真机验证。
+
 ## v1.0.8 修复
 
 - 在窗口脚本及 Worker 启动时建立私有内置函数快照，统一保存反射、Object/Array/Number/Math/JSON、集合操作及运行路径所需的原型方法。函数伪装表使用保存的 WeakMap 方法，网页替换 `WeakMap.prototype.get` 不再使 Date、定位等包装函数暴露源码。

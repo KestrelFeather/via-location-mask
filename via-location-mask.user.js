@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.8
+// @version      1.0.9
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -86,11 +86,30 @@
     I.Math = snapshot(root.Math);
     I.JSON = snapshot(root.JSON);
     I.Proxy = root.Proxy;
+    const PromiseCtor = root.Promise, promiseResolve = PromiseCtor.resolve;
+    I.Promise = PromiseCtor;
+    I.promiseResolve = (value) => apply(promiseResolve, PromiseCtor, [value]);
+    const setTimer = root.setTimeout, clearTimer = root.clearTimeout;
+    const microtask = root.queueMicrotask;
+    I.setTimeout = (...args) => apply(setTimer, root, args);
+    I.clearTimeout = (...args) => apply(clearTimer, root, args);
+    I.queueMicrotask = (...args) => apply(microtask, root, args);
     I.ObjectCtor = root.Object;
     I.NumberCtor = root.Number;
     I.BooleanCtor = root.Boolean;
     I.StringCtor = root.String;
     I.RegExp = root.RegExp;
+    // Share native option reads across Date, Intl and Temporal (also in workers).
+    // Do not read timeZone eagerly: getters must run in the native order with
+    // their original receiver. An empty target permits frozen undefined values.
+    I.withTimezone = (options, timezone) => {
+      if (options === null) return options; // Preserve native invalid-option errors.
+      const original = options === undefined ? create(null) : I.ObjectCtor(options);
+      return new I.Proxy(create(null), { get(_, key) {
+        const value = I.Reflect.get(original, key, original);
+        return key === "timeZone" && value === undefined ? timezone : value;
+      } });
+    };
     I.bind = uncurried(root.Function.prototype.bind);
     I.hasOwn = uncurried(root.Object.prototype.hasOwnProperty);
     I.lookupGetter = uncurried(root.Object.prototype.__lookupGetter__);
@@ -247,7 +266,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.8";
+  const VERSION = "1.0.9";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -776,14 +795,14 @@
   }
 
   function wait(milliseconds) {
-    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+    return new I.Promise((resolve) => I.setTimeout(resolve, milliseconds));
   }
 
   function requestText(url, options = {}) {
     const timeout = finiteNumber(options.timeout, 8000);
     const headers = { Accept: options.accept || "application/json" };
     if (typeof GM_xmlhttpRequest === "function") {
-      return new Promise((resolve, reject) => {
+      return new I.Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: "GET",
           url,
@@ -810,13 +829,13 @@
       });
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
+    const timer = I.setTimeout(() => controller.abort(), timeout);
     return fetch(url, { headers, credentials: "omit", signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error("HTTP " + response.status);
         return response.text();
       })
-      .finally(() => clearTimeout(timer));
+      .finally(() => I.clearTimeout(timer));
   }
 
   async function requestJson(url, options) {
@@ -1085,7 +1104,7 @@
 
   function installAutoVpnSync() {
     if (!settings.vpnAutoSync) return;
-    setTimeout(() => runAutoVpnCheck("page-open"), 1500);
+    I.setTimeout(() => runAutoVpnCheck("page-open"), 1500);
     const interval = I.Math.max(5, settings.vpnCheckMinutes) * 60 * 1000;
     setInterval(() => runAutoVpnCheck("interval"), interval);
     addEventListener("online", () => runAutoVpnCheck("online"));
@@ -1588,8 +1607,8 @@
 
   function deliver(callback, value, delay) {
     const bound = I.bind(callback, undefined, value);
-    if (delay == null) queueMicrotask(bound);
-    else setTimeout(bound, delay);
+    if (delay == null) I.queueMicrotask(bound);
+    else I.setTimeout(bound, delay);
   }
 
   function buildGeolocationOverrides(realm, native) {
@@ -1671,24 +1690,24 @@
           success(freshPosition());
         } catch (callbackError) {
           if (typeof realm.reportError === "function") realm.reportError(callbackError);
-          else setTimeout(() => { throw callbackError; }, 0);
+          else I.setTimeout(() => { throw callbackError; }, 0);
         }
       };
       const schedule = () => {
         if (!record.active || !protectionActive()) return;
-        record.timer = setTimeout(() => {
+        record.timer = I.setTimeout(() => {
           emit();
           schedule();
         }, 1000 + randomUnit() * 1000);
       };
-      record.timer = setTimeout(() => {
+      record.timer = I.setTimeout(() => {
         emit();
         schedule();
       }, 10 + randomUnit() * 40);
 
       const stop = () => {
         record.active = false;
-        clearTimeout(record.timer);
+        I.clearTimeout(record.timer);
         I.Mapdelete(syntheticWatches, watchId);
       };
       record.stop = stop;
@@ -1801,7 +1820,7 @@
         descriptor &&
         descriptor.name === "geolocation"
       ) {
-        return Promise.resolve(createPermissionStatus(realm));
+        return I.promiseResolve(createPermissionStatus(realm));
       }
       return I.Reflect.apply(native.permissionsQuery, this, [descriptor]);
     }
@@ -1919,12 +1938,7 @@
           args[localeIndex] = settings.languages;
         }
         if (injectTimezone && protectionActive() && settings.timezoneEnabled) {
-          const rawOptions = args[optionsIndex];
-          if (rawOptions == null || rawOptions.timeZone === undefined) {
-            args[optionsIndex] = I.Object.assign({}, rawOptions || {}, {
-              timeZone: settings.timezone,
-            });
-          }
+          args[optionsIndex] = I.withTimezone(args[optionsIndex], settings.timezone);
         }
         return I.Reflect.apply(nativeMethod, this, args);
       },
@@ -1981,12 +1995,7 @@
           args[0] = settings.languages;
         }
         if (protectionActive() && settings.timezoneEnabled) {
-          const rawOptions = args[1];
-          if (rawOptions == null || rawOptions.timeZone === undefined) {
-            args[1] = I.Object.assign({}, rawOptions || {}, {
-              timeZone: settings.timezone,
-            });
-          }
+          args[1] = I.withTimezone(args[1], settings.timezone);
         }
         return args;
       });
@@ -2705,19 +2714,7 @@
           args[0] = locales;
         }
         const timezone = getTimezone();
-        const options = args[1];
-        if (timezone && options === undefined) args[1] = { timeZone: timezone };
-        else if (timezone && options !== null) {
-          // Preserve inherited options, getter order and invalid-option errors.
-          // Let native Intl read each property once, substituting only the default.
-          const originalOptions = I.ObjectCtor(options);
-          // An empty proxy target also supports frozen {timeZone: undefined};
-          // overriding that property on the original target violates invariants.
-          args[1] = new I.Proxy({}, { get(_, key) {
-            const value = I.Reflect.get(originalOptions, key, originalOptions);
-            return key === "timeZone" && value === undefined ? timezone : value;
-          } });
-        }
+        if (timezone) args[1] = I.withTimezone(args[1], timezone);
         return I.Reflect.apply(nativeLocaleString, this, args);
       },
     }.toLocaleString);
@@ -3051,10 +3048,7 @@
 
         if (config.localeEnabled && defaultLocales(args[0])) args[0] = config.languages;
         if (injectTimezone && config.timezoneEnabled) {
-          const options = args[1];
-          if (options == null || options.timeZone === undefined) {
-            args[1] = I.Object.assign({}, options || {}, { timeZone: config.timezone });
-          }
+          args[1] = I.withTimezone(args[1], config.timezone);
         }
         const target = new.target && new.target !== Wrapped ? new.target : Native;
         if (!new.target) return I.Reflect.apply(Native, this, args);
@@ -3282,12 +3276,7 @@
             args[localeIndex] = config.languages;
           }
           if (withTimezone && config.timezoneEnabled) {
-            const options = args[optionsIndex];
-            if (options == null || options.timeZone === undefined) {
-              args[optionsIndex] = I.Object.assign({}, options || {}, {
-                timeZone: config.timezone,
-              });
-            }
+            args[optionsIndex] = I.withTimezone(args[optionsIndex], config.timezone);
           }
           return I.Reflect.apply(nativeMethod, this, args);
         },
@@ -3889,7 +3878,7 @@
           (I.methods.join(I.methods.filter([result.city, result.country], I.BooleanCtor), ", ") || result.ip) +
           "；即将刷新页面。";
         updateVpnStatus();
-        setTimeout(() => location.reload(), 700);
+        I.setTimeout(() => location.reload(), 700);
       } catch (error) {
         const network = readNetworkState();
         network.lastError = I.methods.slice(I.StringCtor(error && error.message || error), 0, 500);

@@ -19,6 +19,7 @@ const injection=`(()=>{const values=new Map([
 
 async function probe({dom=false,poison=false,workerURL=null}={}) {
   const apply=Reflect.apply,define=Object.defineProperty,descriptor=Object.getOwnPropertyDescriptor;
+  const setTimer=setTimeout,clearTimer=clearTimeout;
   const mask=Function.prototype.toString;
   const counts={},saved=[],leaked=[];
   function hook(target,key,label) {
@@ -27,11 +28,14 @@ async function probe({dom=false,poison=false,workerURL=null}={}) {
     define(target,key,{...desc,value:function(...args){
       counts[label]++;
       if(label==='Reflect.apply'&&typeof args[0]==='function')leaked[leaked.length]=args[0];
+      if((label==='global.setTimeout'||label==='global.queueMicrotask')&&typeof args[0]==='function')leaked[leaked.length]=args[0];
       if(poison)throw Error('page hook '+label);
       return apply(desc.value,this,args);
     }});
   }
   const groups=[
+    [globalThis,'global',['setTimeout','clearTimeout','queueMicrotask']],
+    [Promise,'Promise',['resolve']],
     [Reflect,'Reflect',['apply','construct','get','getOwnPropertyDescriptor','getPrototypeOf','ownKeys']],
     [Object,'Object',['assign','create','defineProperty','freeze','getOwnPropertyDescriptor','getPrototypeOf','keys','setPrototypeOf']],
     [WeakMap.prototype,'WeakMap',['get','set','has','delete']],
@@ -73,11 +77,15 @@ async function probe({dom=false,poison=false,workerURL=null}={}) {
       frame.document.body.insertAdjacentHTML('beforeend','<iframe></iframe>');
       value.nestedHour=new frame.frames[0].Date(0).getHours();
       value.latitude=await new Promise(resolve=>navigator.geolocation.getCurrentPosition(p=>resolve(p.coords.latitude)));
-      await new Promise(resolve=>{const id=navigator.geolocation.watchPosition(()=>{navigator.geolocation.clearWatch(id);resolve()})});
+      value.cachedLatitude=await new Promise(resolve=>navigator.geolocation.getCurrentPosition(p=>resolve(p.coords.latitude),null,{maximumAge:60000}));
+      await new Promise(resolve=>{let calls=0;const id=navigator.geolocation.watchPosition(()=>{
+        if(++calls===2){navigator.geolocation.clearWatch(id);resolve()}
+      })});
+      value.permission=(await navigator.permissions.query({name:'geolocation'})).state;
       if(workerURL)value.workerHour=await new Promise((resolve,reject)=>{
-        const w=new Worker(workerURL),timer=setTimeout(()=>reject(Error('worker timeout')),4000);
-        w.onmessage=e=>{clearTimeout(timer);w.terminate();resolve(e.data)};
-        w.onerror=e=>{clearTimeout(timer);reject(Error(e.message||'worker error'))};
+        const w=new Worker(workerURL),timer=apply(setTimer,globalThis,[()=>reject(Error('worker timeout')),4000]);
+        w.onmessage=e=>{apply(clearTimer,globalThis,[timer]);w.terminate();resolve(e.data)};
+        w.onerror=e=>{apply(clearTimer,globalThis,[timer]);reject(Error(e.message||'worker error'))};
       });
       host.remove();
     }
@@ -95,7 +103,7 @@ function verify(result,dom){
   const observed=Object.entries(result.counts).filter(([,count])=>count);assert.deepEqual(observed,[]);
   assert.equal(result.value.hour,9);assert.equal(result.value.temporal,'09');assert.equal(result.value.localHour,3);
   for(const mask of result.value.masks)assert.match(mask,/\[native code\]/);
-  if(dom){assert.equal(result.value.frameHour,9);assert.equal(result.value.nestedHour,9);assert.match(result.value.frameMask,/\[native code\]/);assert.ok(Number.isFinite(result.value.latitude));assert.equal(result.value.workerHour,9)}
+  if(dom){assert.equal(result.value.frameHour,9);assert.equal(result.value.nestedHour,9);assert.match(result.value.frameMask,/\[native code\]/);assert.ok(Number.isFinite(result.value.latitude));assert.equal(result.value.cachedLatitude,result.value.latitude);assert.equal(result.value.permission,'granted');assert.equal(result.value.workerHour,9)}
 }
 (async()=>{
   server=http.createServer((req,res)=>{res.setHeader('Content-Type','text/html');res.end('<!doctype html><body></body>')});

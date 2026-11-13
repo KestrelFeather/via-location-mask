@@ -10,9 +10,21 @@ node tests/date-and-realms.cjs
 node tests/review-regressions.cjs
 node tests/hardening-regressions.cjs
 node tests/intrinsic-regressions.cjs
+node tests/locale-options-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.9 验证结果
+
+实际浏览器：Edge 157.0.4341.46。扩展后的 `intrinsic-regressions.cjs` 8/8、新增 `locale-options-regressions.cjs` 4/4；原有四套分别 24/24、15/15、32/32、34/34，总计 117 组通过。语法检查及 `git diff --check` 通过，本轮 review 套件设置 `VLM_SKIP_BENCH=1`，保留 DOM 调用计数断言，未重跑毫秒性能基准。
+
+- 内置函数挂钩加入 `setTimeout`、`clearTimeout`、`queueMicrotask` 和 `Promise.resolve`，同时记录传入定时器/微任务的函数，检测内部回调泄漏。测试执行首次定位、缓存定位、监听的首次及第二次回调、取消监听、权限查询；记录模式和抛错模式均通过，所测入口调用计数与截获函数数均为 0。测试自己的超时计时使用挂钩前保存的入口，避免把测试调用计入脚本。
+- 格式化对照以未注入脚本、真实时区为 Asia/Tokyo 的页面为基准，在 America/New_York 中注入东京伪装。主页面、嵌套 iframe、Worker、SharedWorker 分别比较 98 个用例，涉及 Date 三个 `toLocale*`、Intl.DateTimeFormat 的构造/普通调用、Temporal.Instant 格式化，以及 Date 非法接收者/无效日期。
+- 选项覆盖继承属性、不可枚举属性、冻结的 undefined 时区、显式 UTC、undefined/null/基本类型、非法时区、不得读取的无关 getter、Proxy 读取轨迹、getter 的接收者/次数/顺序和页面异常对象身份。输出及上述可观测行为均与原生基准一致。
+- `VLM_SOURCE` 指向 v1.0.8（`c1ab848`）时，同样的格式化对照 4 组全部失败，内置函数回归中的窗口观测/抛错 2 组失败；观测模式能截获监听续订的箭头函数源码。
+
+上述原生对照只针对本次格式化选项语义，不改变下文已有的历史 Date 算法差异。快照防护仍以安装后替换为边界，未做 Via/Android 真机验证，也不代表消除了所有指纹路径。
 
 ## v1.0.8 验证结果
 
