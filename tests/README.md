@@ -11,9 +11,30 @@ node tests/review-regressions.cjs
 node tests/hardening-regressions.cjs
 node tests/intrinsic-regressions.cjs
 node tests/locale-options-regressions.cjs
+node tests/locale-cache-regressions.cjs
 ```
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
+
+## v1.0.10 验证结果
+
+实际浏览器：Edge 157.0.4341.46。新增 `locale-cache-regressions.cjs` 3/3，扩展后的原生选项对照 4/4、内置函数回归 8/8，既有四套分别 24/24、15/15、32/32、34/34，共 120 组通过。语法检查及 `git diff --check` 通过；本轮 review 套件设置 `VLM_SKIP_BENCH=1`，保留 DOM 调用计数断言。
+
+- 缓存确定性断言：三个方法各执行 2000 次，合计只创建三个原生 DateTimeFormat，不再进入 Date 的原生慢路径；显式 `undefined`/空对象/冻结 options 和 locales 数组仍进入原生路径。通过注入前的测试计数器验证构造次数，不依赖耗时阈值。
+- 切换时区、语言、语言开关、时区开关及总开关后输出正确；40 种 locale 字符串触发容量淘汰，重新访问被淘汰项会重建且输出正确。测试用设置入口只存在于 fixture，不进入发布脚本。
+- 原生格式化对照新增九种 locales（含默认语言、日历/数字/小时周期扩展）、七种时间值及无参数调用；检查缓存首次调用与命中、无效 Date/接收者、语言对象 getter 的逐次读取，以及 Date 自有 valueOf 不被调用。主页面、嵌套 iframe、Worker/SharedWorker 均与真实东京时区的原生结果一致。
+- 内置函数回归新增默认格式化和缓存命中路径，页面在安装后替换相关内置入口时，计数及截获函数数仍为 0。
+- `VLM_SOURCE` 指向 v1.0.9（`930d6cf`）时，缓存复用/容量两组失败，设置行为一组通过。
+
+设置 `VLM_BENCH=1` 运行 `locale-cache-regressions.cjs` 可附加性能对照，需要 Git 历史中的 v1.0.9 提交 `930d6cf`。每格为三个新页面的中位耗时；先预热 200 次，再对同一个 `new Date(0)` 调用 20000 次，显式 locales 为 `'en-US'`，完全省略 options。原生页面时区为东京，脚本页面时区为纽约并伪装为东京；输出长度校验和相同。耗时仅作测量记录，不作为测试通过阈值。
+
+| 方法（20000 次） | 原生 | v1.0.9 | v1.0.10 |
+| --- | ---: | ---: | ---: |
+| toLocaleString | 14.8 ms | 837.1 ms | 16.7 ms |
+| toLocaleDateString | 10.1 ms | 862.6 ms | 11.8 ms |
+| toLocaleTimeString | 10.3 ms | 848.9 ms | 11.8 ms |
+
+缓存只在时区伪装生效时启用；设置变化在下次使用缓存前失效，Worker 仍保留启动时配置。未做 Via/Android 真机测试，已有历史 Date 算法差异保持不变。
 
 ## v1.0.9 验证结果
 

@@ -69,6 +69,9 @@ async function probe({dom=false,poison=false,workerURL=null}={}) {
     const date=new Date(2024,2,10,2,30);date.setHours(3);
     const temporal=Temporal.Instant.fromEpochMilliseconds(0).toLocaleString('en-US',{hour:'2-digit',hourCycle:'h23'});
     value={masks,hour,text,temporal,localHour:date.getHours()};
+    value.defaultDate=new Date(0).toLocaleString('en-US');
+    value.cachedDate=new Date(0).toLocaleString('en-US');
+    value.defaultLocaleDate=new Date(0).toLocaleString();
     if(dom){
       const host=document.createElement('div');document.body.appendChild(host);
       host.innerHTML='<iframe></iframe>';
@@ -102,6 +105,8 @@ function verify(result,dom){
   assert.equal(result.error,undefined);assert.deepEqual(result.leaked,[]);
   const observed=Object.entries(result.counts).filter(([,count])=>count);assert.deepEqual(observed,[]);
   assert.equal(result.value.hour,9);assert.equal(result.value.temporal,'09');assert.equal(result.value.localHour,3);
+  assert.equal(result.value.defaultDate,'1/1/1970, 9:00:00 AM');
+  assert.equal(result.value.cachedDate,result.value.defaultDate);assert.equal(result.value.defaultLocaleDate,'1970/1/1 9:00:00');
   for(const mask of result.value.masks)assert.match(mask,/\[native code\]/);
   if(dom){assert.equal(result.value.frameHour,9);assert.equal(result.value.nestedHour,9);assert.match(result.value.frameMask,/\[native code\]/);assert.ok(Number.isFinite(result.value.latitude));assert.equal(result.value.cachedLatitude,result.value.latitude);assert.equal(result.value.permission,'granted');assert.equal(result.value.workerHour,9)}
 }

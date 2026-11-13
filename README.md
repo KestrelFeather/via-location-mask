@@ -51,6 +51,14 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.10 优化
+
+- 为未传 options 的 Date `toLocaleString`、`toLocaleDateString`、`toLocaleTimeString` 缓存原生格式化器，按方法、语言和时区复用，避免每次注入时区都重新构造格式化器。窗口、同源 iframe 和 Worker/SharedWorker 使用同一实现。
+- 仅对 locales 为字符串或省略的调用启用快路径；显式 options（包括 `undefined`、空对象）及语言数组/对象继续走原有路径，保留每次调用的 getter 行为。设置变化后，在下次使用前清空缓存；每个 realm 的缓存最多 32 项。
+- 覆盖不同语言、日历、数字与小时周期、无效日期/接收者、设置切换、缓存淘汰和页面内置函数挂钩。
+
+Edge 157.0.4341.46 上，2 万次 `toLocaleString('en-US')` 的三次中位耗时：原生 14.8 ms、v1.0.9 为 837.1 ms、本版 16.7 ms。七套回归共 120 组通过。桌面耗时不代表手机性能，完整测量方法及另两个方法的结果见 [测试说明](tests/README.md)。
+
 ## v1.0.9 修复
 
 - 启动时保存 `setTimeout`、`clearTimeout`、`queueMicrotask` 并绑定安装时的全局对象，同时保存 Promise 构造器和带正确接收者的 `Promise.resolve`。定位首次投递、缓存投递、监听续订/取消及权限查询不再调用网页后续替换的这些入口，也不再通过它们泄漏内部回调。

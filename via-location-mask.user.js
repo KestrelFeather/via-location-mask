@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.9
+// @version      1.0.10
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -261,12 +261,46 @@
     I.dateParse = root.Date.parse;
     I.formatToParts = uncurried(root.Intl.DateTimeFormat.prototype.formatToParts);
     I.resolvedOptions = uncurried(root.Intl.DateTimeFormat.prototype.resolvedOptions);
+    I.createDefaultDateFormatter = (NativeDateTimeFormat) => {
+      const formatGetter = descriptor(NativeDateTimeFormat.prototype, "format").get;
+      let entries = [], lastTimezone, lastSettings;
+      return (receiver, property, locales, timezone, settingsToken) => {
+        let time;
+        try { time = I.methods.getTime(receiver); } catch (_) { return undefined; }
+        // Delegate invalid receivers/dates to the native method for its exact
+        // error or Invalid Date result, before it ever inspects locales.
+        if (I.Number.isNaN(time)) return undefined;
+        if (timezone !== lastTimezone || settingsToken !== lastSettings) {
+          entries = [];
+          lastTimezone = timezone;
+          lastSettings = settingsToken;
+        }
+        for (let index = 0; index < entries.length; index++) {
+          const entry = entries[index];
+          if (entry.property === property && entry.locales === locales) return entry.format(time);
+        }
+        const options = create(null);
+        options.timeZone = timezone;
+        if (property !== "toLocaleTimeString") {
+          options.year = options.month = options.day = "numeric";
+        }
+        if (property !== "toLocaleDateString") {
+          options.hour = options.minute = options.second = "numeric";
+        }
+        const formatter = new NativeDateTimeFormat(locales, options);
+        const format = apply(formatGetter, formatter, []);
+        // Bound memory even when a page cycles through many locale strings.
+        if (entries.length === 32) entries = [];
+        entries[entries.length] = { property, locales, format };
+        return format(time);
+      };
+    };
     return I;
   }
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.9";
+  const VERSION = "1.0.10";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -1926,18 +1960,25 @@
     }
   }
 
-  function installLocaleMethod(target, property, localeIndex, optionsIndex, injectTimezone) {
+  function installLocaleMethod(target, property, localeIndex, optionsIndex, injectTimezone, formatDefault) {
     if (!target || typeof target[property] !== "function") return;
     const nativeMethod = target[property];
     installOverride(
       target,
       property,
       function localeAwareMethod(...args) {
-
+        // Locale objects/arrays may have observable getters on every call.
+        // Explicit options (even undefined) retain the native/proxy path.
+        const cacheable = args.length <= optionsIndex &&
+          (args[localeIndex] === undefined || typeof args[localeIndex] === "string");
         if (protectionActive() && settings.localeEnabled && isDefaultLocaleRequest(args[localeIndex])) {
           args[localeIndex] = settings.languages;
         }
         if (injectTimezone && protectionActive() && settings.timezoneEnabled) {
+          if (cacheable) {
+            const result = formatDefault(this, property, args[localeIndex], settings.timezone, settings);
+            if (result !== undefined) return result;
+          }
           args[optionsIndex] = I.withTimezone(args[optionsIndex], settings.timezone);
         }
         return I.Reflect.apply(nativeMethod, this, args);
@@ -1946,7 +1987,7 @@
     );
   }
 
-  function installLocaleMethods(realm) {
+  function installLocaleMethods(realm, NativeDateTimeFormat) {
     installLocaleMethod(realm.Number && realm.Number.prototype, "toLocaleString", 0, 1, false);
     installLocaleMethod(realm.BigInt && realm.BigInt.prototype, "toLocaleString", 0, 1, false);
     installLocaleMethod(realm.String && realm.String.prototype, "localeCompare", 1, 2, false);
@@ -1965,9 +2006,10 @@
         installLocaleMethod(Constructor.prototype, "toLocaleString", 0, 1, false);
       }
     }
-    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleString", 0, 1, true);
-    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleDateString", 0, 1, true);
-    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleTimeString", 0, 1, true);
+    const formatDefault = I.createDefaultDateFormatter(NativeDateTimeFormat);
+    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleString", 0, 1, true, formatDefault);
+    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleDateString", 0, 1, true, formatDefault);
+    installLocaleMethod(realm.Date && realm.Date.prototype, "toLocaleTimeString", 0, 1, true, formatDefault);
   }
 
   function installIntlOverrides(realm) {
@@ -2726,7 +2768,7 @@
     installNavigatorLocale(realm);
     installDateOverrides(realm, NativeDate, NativeDateTimeFormat);
     installIntlOverrides(realm);
-    installLocaleMethods(realm);
+    installLocaleMethods(realm, NativeDateTimeFormat);
     patchTemporalOverrides(realm, () => protectionActive() && settings.timezoneEnabled
       ? settings.timezone : null, installOverride,
       () => protectionActive() && settings.localeEnabled ? settings.languages : null, I);
@@ -2987,6 +3029,7 @@
   function workerBootstrap(config, createZoneTools, patchTemporalOverrides, captureIntrinsics) {
     "use strict";
     const I = captureIntrinsics(self);
+    const formatDefault = I.createDefaultDateFormatter(Intl.DateTimeFormat);
     const nativeToString = Function.prototype.toString;
     const nativeNames = I.newWeakMap();
     const mark = (fn, name, length) => {
@@ -3271,11 +3314,16 @@
       const nativeMethod = target[property];
       target[property] = mark({
         [property](...args) {
-
+          const cacheable = args.length <= optionsIndex &&
+            (args[localeIndex] === undefined || typeof args[localeIndex] === "string");
           if (config.localeEnabled && defaultLocales(args[localeIndex])) {
             args[localeIndex] = config.languages;
           }
           if (withTimezone && config.timezoneEnabled) {
+            if (cacheable) {
+              const result = formatDefault(this, property, args[localeIndex], config.timezone, config);
+              if (result !== undefined) return result;
+            }
             args[optionsIndex] = I.withTimezone(args[optionsIndex], config.timezone);
           }
           return I.Reflect.apply(nativeMethod, this, args);
