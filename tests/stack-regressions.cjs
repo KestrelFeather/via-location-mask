@@ -27,6 +27,12 @@ function stackProbe(){
     functionSource(){Function.prototype.toString.call({})},
     dateConstructor(){new Date(Symbol())},
     dateText(){Date.prototype.toString.call({})},
+    intlGetter(){new Intl.DateTimeFormat('en',{get hour(){null.x}})},
+    intlGetterNative(){new Intl.DateTimeFormat('en',{get hour(){Date.prototype.getHours.call({})}})},
+    intlGetterReflect(){new Intl.DateTimeFormat('en',{get hour(){return Reflect.get(1,'x')}})},
+    intlGetterSameName(){function nativeApply(){null.x}new Intl.DateTimeFormat('en',{get hour(){return nativeApply()}})},
+    instantGetter(){Temporal.Instant.fromEpochMilliseconds(0).toLocaleString('en',{get hour(){null.x}})},
+    instantGetterNative(){Temporal.Instant.fromEpochMilliseconds(0).toLocaleString('en',{get hour(){new Intl.DateTimeFormat('en',{timeZone:'Bad/Zone'})}})},
   };
   if(typeof document!=='undefined')Object.assign(cases,{
     append(){document.body.appendChild('x')},
@@ -37,6 +43,9 @@ function stackProbe(){
     sharedWorker(){new SharedWorker()},
     navigatorGetter(){Object.getOwnPropertyDescriptor(Navigator.prototype,'language').get.call({})},
     geo(){navigator.geolocation.getCurrentPosition()},
+    workerGetter(){const url=URL.createObjectURL(new Blob(['']));try{new Worker(url,{get type(){null.x}})}finally{URL.revokeObjectURL(url)}},
+    sharedGetter(){const url=URL.createObjectURL(new Blob(['']));try{new SharedWorker(url,{get name(){null.x}})}finally{URL.revokeObjectURL(url)}},
+    urlWorkerGetter(){new Worker(new URL('/unused.js',document.baseURI).href,{get type(){null.x}})},
   });
   function pageCaller(fn){try{fn()}catch(e){return {name:e.name,message:e.message,stack:e.stack}}throw Error('did not throw')}
   const results={};for(const key of Object.keys(cases))results[key]=pageCaller(cases[key]);
@@ -54,7 +63,7 @@ function pageErrorProbe(){
     for(const fresh of [false,true]){
       let error=new TypeError('page sentinel'),before=error.stack;
       function nativeApply(){if(fresh){try{JSON.parse('!')}catch(e){error=e;before=e.stack}}throw error}
-      try{run(nativeApply)}catch(e){checks.push(e===error&&e.stack===before)}
+      try{run(nativeApply)}catch(e){checks.push(e===error&&(fresh||e.stack===before))}
     }
     for(const thrown of [undefined,null,'sentinel',Symbol('sentinel')]){
       try{run(()=>{throw thrown})}catch(e){checks.push(e===thrown)}
@@ -67,6 +76,31 @@ function pageErrorProbe(){
     try{run(()=>{throw error})}catch(e){checks.push(e===error&&reads===0&&Object.getOwnPropertyDescriptor(e,'stack').get===before.get)}
   }
   return checks;
+}
+function eventErrorProbe(nested=false,poison=false){
+  const results={},errors=[];
+  const errorDescriptor=Object.getOwnPropertyDescriptor(ErrorEvent.prototype,'error');let hookCalls=0;
+  if(poison)Object.defineProperty(ErrorEvent.prototype,'error',{...errorDescriptor,get(){hookCalls++;throw Error('page error getter hook')}});
+  const previous=window.onerror;
+  function record(event,phase){
+    const error=Reflect.apply(errorDescriptor.get,event,[]);
+    errors.push(error);results[phase]={stack:error.stack,name:error.name,message:error.message,prevented:event.defaultPrevented};
+  }
+  function capture(event){record(event,'capture')}
+  function bubble(event){record(event,'bubble')}
+  window.addEventListener('error',capture,true);window.addEventListener('error',bubble);
+  window.onerror=function(message,url,line,column,error){errors.push(error);results.onerror={stack:error.stack,name:error.name,message:error.message};return true};
+  const tag=nested?'stack-nested-element':'stack-error-element';
+  customElements.define(tag,class extends HTMLElement {connectedCallback(){null.x}});
+  function insertIt(){document.body.appendChild(document.createElement(tag))}
+  function pageCaller(){
+    if(nested)new Intl.DateTimeFormat('en',{get hour(){insertIt();return 'numeric'}});
+    else insertIt();
+  }
+  try{pageCaller()}finally{window.removeEventListener('error',capture,true);window.removeEventListener('error',bubble);window.onerror=previous;Object.defineProperty(ErrorEvent.prototype,'error',errorDescriptor)}
+  results.sameError=errors.length===3&&errors.every(error=>error===errors[0]);
+  results.hookCalls=hookCalls;
+  return results;
 }
 const probeCode=`globalThis.runStackProbe=(${stackProbe});globalThis.runPageErrorProbe=(${pageErrorProbe});\n//# sourceURL=page-stack-cases.js`;
 let browser,server,origin,total=0,failures=0;
@@ -118,6 +152,28 @@ function verify(actual,expected){
   }));
   for(const shared of [false,true])await check(`${shared?'SharedWorker':'Worker'} stacks and page errors`,async()=>{
     verify(await withPage(true,p=>workerProbe(p,shared)),await withPage(false,p=>workerProbe(p,shared)));
+  });
+  for(const child of [false,true])for(const nested of [false,true])for(const poison of [false,true])await check(`${child?'iframe':'window'} connectedCallback ${nested?'inside getter':'direct'} ${poison?'poisoned event getter':'error reporting'}`,async()=>{
+    const run=page=>page.evaluate(({code,child,nested,poison})=>{
+      let realm=window;if(child){const frame=document.createElement('iframe');document.body.appendChild(frame);realm=frame.contentWindow}
+      realm.eval('globalThis.eventErrorProbe='+code+';\n//# sourceURL=page-event-cases.js');
+      return realm.eval('eventErrorProbe('+nested+','+poison+');\n//# sourceURL=page-event-entry.js');
+    },{code:eventErrorProbe.toString(),child,nested,poison});
+    const actual=await withPage(true,run);assert.deepEqual(actual,await withPage(false,run));
+    assert.equal(actual.sameError,true);assert.equal(actual.hookCalls,0);
+  });
+  for(const child of [false,true])await check(`${child?'iframe':'window'} early stack read retains identity but is cleaned on escape`,async()=>{
+    const run=page=>page.evaluate(child=>{
+      let realm=window;if(child){const frame=document.createElement('iframe');document.body.appendChild(frame);realm=frame.contentWindow}
+      return realm.eval(`(()=>{
+        let original,before;
+        try{new Intl.DateTimeFormat('en',{get hour(){try{null.x}catch(e){original=e;before=e.stack;throw e}}})}
+        catch(e){return {same:e===original,before,after:e.stack}}
+      })();\n//# sourceURL=page-early-stack.js`);
+    },child);
+    const actual=await withPage(true,run),expected=await withPage(false,run);
+    assert.equal(actual.same,true);assert.equal(expected.before,expected.after);
+    assert.notEqual(actual.before,actual.after);assert.equal(actual.after,expected.after);
   });
 })().catch(e=>{failures++;console.error(e)}).finally(async()=>{
   if(browser)await browser.close();if(server)await new Promise(r=>server.close(r));

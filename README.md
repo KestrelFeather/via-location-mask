@@ -51,6 +51,14 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.12 修复
+
+- 页面选项 getter 在包装函数内抛错时，也会清理堆栈中的脚本帧。按启动时校准的精确调用位置识别转发代理及调用入口，保留页面帧、原生帧和错误对象身份，再重建调用方部分；不按函数名删除帧。Intl、Temporal 和 Worker 选项共用代理实现，直接属性读取保留原始 getter 接收者，并避免额外的 Reflect.get 帧。
+- 每个窗口安装捕获阶段 `error` 监听器，在自定义元素等原生同步回调上报异常时清理 `event.error.stack`，覆盖尚未返回到包装函数 catch 的情况。不会取消事件、停止传播或更换错误对象；读取 event.error 使用安装时保存的原生 getter。
+- 通过主页面、iframe、Worker/SharedWorker 的逐帧对照，包含 getter 内再调用包装 API、getter 内插入自定义元素、短堆栈和页面替换 ErrorEvent.error getter。扩展堆栈测试 26/26，连同既有回归共 146 组通过。
+
+**读栈时机边界：** 清理发生在异常经过选项代理/公开包装出口，或同步 error 事件进入脚本监听器时。如果页面已在 getter 或回调内保存、上报了 `e.stack` 字符串，该副本无法撤回；之后读取错误对象的 stack 可能得到不同的清理结果。安装前已注册且先执行的 error 捕获监听器也可能先看到未清理值。自定义 `Error.prepareStackTrace`、异步 Promise 拒绝及错误事件 filename 不在清理范围内。完整验证见 [测试说明](tests/README.md)。
+
 ## v1.0.11 修复
 
 - 将定位错误的堆栈保护扩展到方法、访问器和构造器包装边界，覆盖 Date、Intl、Temporal、DOM 插入、Worker/SharedWorker 等原生异常路径。使用保存的原生调用入口标记异常，在外层确认原生来源后保留原生帧，并重新捕获页面调用方帧，移除脚本内部和重复包装帧；支持匿名注入及各 realm 独立的 `Error.stackTraceLimit`。

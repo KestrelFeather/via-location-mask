@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.11
+// @version      1.0.12
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -106,10 +106,7 @@
     I.withTimezone = (options, timezone) => {
       if (options === null) return options; // Preserve native invalid-option errors.
       const original = options === undefined ? create(null) : I.ObjectCtor(options);
-      return new I.Proxy(create(null), { get(_, key) {
-        const value = I.Reflect.get(original, key, original);
-        return key === "timeZone" && value === undefined ? timezone : value;
-      } });
+      return I.optionProxy(original, { timezone });
     };
     I.bind = uncurried(root.Function.prototype.bind);
     I.hasOwn = uncurried(root.Object.prototype.hasOwnProperty);
@@ -264,9 +261,8 @@
     I.resolvedOptions = uncurried(root.Intl.DateTimeFormat.prototype.resolvedOptions);
     const NativeError = root.Error, captureStack = NativeError.captureStackTrace;
     I.installErrorRealm = NativeError;
-    let activeErrorRealm = NativeError;
+    let activeErrorRealm = NativeError, activeBoundary = null;
     const stackDescriptor = descriptor(new NativeError(), "stack");
-    const nativeErrors = I.newWeakMap();
     const readStack = (error) => {
       if (stackDescriptor && stackDescriptor.get) return apply(stackDescriptor.get, error, []);
       // Older V8 uses a data property. Never invoke a page's stack getter.
@@ -281,8 +277,14 @@
         frames: I.methods.split(I.methods.slice(stack, start + 1), "\n"),
       };
     };
-    let applyFrame, constructFrame, calibrating = true;
-    const nativeTrace = (error, kind, errorRealm) => {
+    const callSites = I.newSet(), proxySites = I.newSet();
+    let calibrating = true;
+    const position = (frame) => {
+      if (!frame) return "";
+      const start = I.methods.indexOf(frame, " (");
+      return start < 0 ? I.methods.slice(frame, 7) : I.methods.slice(frame, start + 2, -1);
+    };
+    const errorTrace = (error, errorRealm) => {
       try {
         const prepare = descriptor(NativeError, "prepareStackTrace");
         const realmPrepare = descriptor(errorRealm, "prepareStackTrace");
@@ -292,54 +294,58 @@
         if (realmPrepare && (!I.hasOwn(realmPrepare, "value") || typeof realmPrepare.value === "function")) return;
         const trace = splitStack(readStack(error));
         if (!trace) return;
-        let index = 0;
-        while (index < trace.frames.length && I.methods.endsWith(trace.frames[index], " (<anonymous>)")) index++;
-        const frame = trace.frames[index];
-        if (calibrating) {
-          if (kind === "apply") applyFrame = frame;
-          else constructFrame = frame;
-          return;
-        }
-        // A native error starts with zero or more native frames immediately
-        // followed by OUR exact call site. A getter/callback's frame, even one
-        // named nativeApply, cannot match this location. Do not rewrite it.
-        if (!frame || frame !== (kind === "apply" ? applyFrame : constructFrame)) return;
-        return {
-          header: trace.header, prefix: I.methods.slice(trace.frames, 0, index), limit: trace.frames.length,
-        };
+        return trace;
       } catch (_) { /* Non-Error thrown values and custom stack formats pass through. */ }
     };
-    const rememberError = (error, kind, errorRealm) => {
-      if (calibrating) { nativeTrace(error, kind, errorRealm); return; }
-      // Read/format a stack only when an exception escapes the public wrapper.
-      // Internal brand probes and fallback paths often catch native exceptions.
-      try { if (!I.WeakMaphas(nativeErrors, error)) I.WeakMapset(nativeErrors, error, kind); } catch (_) {}
+    const calibrateCall = (error, index) => {
+      const trace = errorTrace(error, NativeError);
+      if (trace && trace.frames[index]) I.Setadd(callSites, position(trace.frames[index]));
     };
-    I.nativeApply = function nativeApply(fn, receiver, args, errorRealm = activeErrorRealm) {
+    I.nativeApply = function nativeApply(fn, receiver, args) {
       try { return apply(fn, receiver, args); }
-      catch (error) { rememberError(error, "apply", errorRealm); throw error; }
+      catch (error) { if (calibrating) calibrateCall(error, 1); throw error; }
     };
     const construct = root.Reflect.construct;
     I.nativeConstruct = function nativeConstruct(fn, args, target = fn) {
       try { return construct(fn, args, target); }
-      catch (error) { rememberError(error, "construct", activeErrorRealm); throw error; }
+      catch (error) { if (calibrating) calibrateCall(error, 1); throw error; }
+    };
+    I.nativeGet = function nativeGetOption(object, key) {
+      try { return object[key]; }
+      catch (error) { if (calibrating) calibrateCall(error, 1); throw error; }
     };
     // Calibrate against actual native exceptions, including anonymous Via eval
     // locations. No filename or function-name blacklist is used for removal.
     try { I.nativeApply(root.Date.prototype.getTime, {}, []); } catch (_) {}
     try { I.nativeConstruct(root.Date, [root.Symbol()]); } catch (_) {}
-    calibrating = false;
-    I.cleanError = (error, wrapper, errorRealm = activeErrorRealm) => {
-      const kind = I.WeakMapget(nativeErrors, error);
-      if (!kind || !captureStack) return;
-      I.WeakMapdelete(nativeErrors, error);
-      const trace = nativeTrace(error, kind, errorRealm);
+    I.cleanError = (error, wrapper, errorRealm = activeErrorRealm, proxyBoundary = false) => {
+      if (!captureStack) return;
+      const trace = errorTrace(error, errorRealm);
       if (!trace) return;
       try {
+        if (calibrating) {
+          if (proxyBoundary && trace.frames[1]) I.Setadd(proxySites, position(trace.frames[1]));
+          return;
+        }
+        const prefix = [];
+        let found = false;
+        for (let index = 0; index < trace.frames.length; index++) {
+          const frame = trace.frames[index], site = position(frame);
+          if (I.Sethas(proxySites, site)) {
+            if (proxyBoundary) { found = true; break; }
+            continue;
+          }
+          if (!proxyBoundary && I.Sethas(callSites, site)) {
+            found = true;
+            break;
+          }
+          prefix[prefix.length] = frame;
+        }
+        if (!found) return; // Pre-existing page errors have no private call sites.
         const holder = create(null);
         const realmLimit = descriptor(errorRealm, "stackTraceLimit");
         const frameLimit = realmLimit && typeof realmLimit.value === "number"
-          ? I.Math.max(0, I.Math.floor(realmLimit.value)) : trace.limit;
+          ? I.Math.max(0, I.Math.floor(realmLimit.value)) : trace.frames.length;
         // The error can belong to an iframe with a different stackTraceLimit.
         // Capture enough caller frames, restoring the root setting immediately.
         const limit = descriptor(NativeError, "stackTraceLimit");
@@ -351,20 +357,66 @@
           else delete NativeError.stackTraceLimit;
         }
         const callers = splitStack(readStack(holder));
-        const frames = I.methods.slice(callers ? I.methods.concat(trace.prefix, callers.frames) : trace.prefix, 0, frameLimit);
+        const frames = I.methods.slice(callers ? I.methods.concat(prefix, callers.frames) : prefix, 0, frameLimit);
         const stack = trace.header + (frames.length ? "\n" + I.methods.join(frames, "\n") : "");
         if (stackDescriptor && stackDescriptor.set) apply(stackDescriptor.set, error, [stack]);
         else I.Object.defineProperty(error, "stack", { value: stack, writable: true, configurable: true });
       } catch (_) {}
     };
+    I.optionProxy = (original, options) => {
+      const errorRealm = activeErrorRealm;
+      const hasType = I.hasOwn(options, "hasType") && options.hasType;
+      const type = hasType ? options.type : undefined;
+      const timezone = I.hasOwn(options, "timezone") ? options.timezone : null;
+      const onError = I.hasOwn(options, "onError") ? options.onError : null;
+      const get = { get(_, key) {
+        if (hasType && key === "type") return type;
+        try {
+          // Direct access keeps the original receiver and avoids an extra
+          // Reflect.get native frame consuming a short stackTraceLimit.
+          const value = original[key];
+          return key === "timeZone" && value === undefined && timezone ? timezone : value;
+        } catch (error) {
+          if (onError) onError();
+          I.cleanError(error, get, errorRealm, true);
+          throw error;
+        }
+      } }.get;
+      const handler = create(null);
+      handler.get = get;
+      return new I.Proxy(create(null), handler);
+    };
+    const probeOptions = create(null);
+    I.Object.defineProperty(probeOptions, "probe", { get() { throw new NativeError("stack calibration"); } });
+    try { I.nativeGet(probeOptions, "probe"); } catch (_) {}
+    try { I.optionProxy(probeOptions, {}).probe; } catch (_) {}
+    calibrating = false;
+    const addListener = root.EventTarget && root.EventTarget.prototype.addEventListener;
+    I.installErrorListener = (realm) => {
+      if (!addListener || !realm.ErrorEvent) return;
+      const getError = descriptor(realm.ErrorEvent.prototype, "error").get;
+      apply(addListener, realm, ["error", (event) => {
+        if (!activeBoundary) return;
+        try {
+          const error = apply(getError, event, []);
+          // Native CE reactions report before the DOM call returns, so no
+          // public catch boundary has run yet. Preserve the event and error.
+          for (let boundary = activeBoundary; boundary; boundary = boundary.previous) {
+            I.cleanError(error, boundary.wrapper, boundary.errorRealm);
+          }
+        } catch (_) {}
+      }, true]);
+    };
     I.guardMethod = (fn) => {
       const errorRealm = I.installErrorRealm;
       const wrapper = { method(...args) {
         const previous = activeErrorRealm;
+        const boundary = activeBoundary;
+        activeBoundary = { wrapper, errorRealm, previous: boundary };
         activeErrorRealm = errorRealm;
         try { return apply(fn, this, args); }
         catch (error) { I.cleanError(error, wrapper); throw error; }
-        finally { activeErrorRealm = previous; }
+        finally { activeErrorRealm = previous; activeBoundary = boundary; }
       } }.method;
       return wrapper;
     };
@@ -372,10 +424,12 @@
       const errorRealm = I.installErrorRealm;
       const wrapper = function (...args) {
         const previous = activeErrorRealm;
+        const boundary = activeBoundary;
+        activeBoundary = { wrapper, errorRealm, previous: boundary };
         activeErrorRealm = errorRealm;
         try { return new.target ? construct(fn, args, new.target) : apply(fn, this, args); }
         catch (error) { I.cleanError(error, wrapper); throw error; }
-        finally { activeErrorRealm = previous; }
+        finally { activeErrorRealm = previous; activeBoundary = boundary; }
       };
       return wrapper;
     };
@@ -420,7 +474,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.11";
+  const VERSION = "1.0.12";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -547,7 +601,7 @@
         try {
           const name = I.WeakMapget(overrideRegistry, this);
           if (name !== undefined) return nativePrefix + name + nativeSuffix;
-          const source = I.nativeApply(nativeToString, this, [], errorRealm);
+          const source = I.nativeApply(nativeToString, this, []);
           // Native functions, bound functions and proxies need no lookup, and
           // skipping them keeps proxy traps from observing the calls below.
           if (delegating || !maskSource || I.methods.test(/\[native code\]\s*\}$/, source)) return source;
@@ -2888,6 +2942,7 @@
     const previousErrorRealm = I.installErrorRealm;
     I.installErrorRealm = realm.Error;
     try {
+      I.installErrorListener(realm);
       installFunctionMaskingOn(realm);
       installEnvironmentOverrides(realm);
       installWorkerPatching(realm);
@@ -3525,10 +3580,7 @@
           let optionGetterThrew = false;
           const patchedArgs = I.methods.slice(args);
           if (args[1] && (typeof args[1] === "object" || typeof args[1] === "function")) {
-            patchedArgs[1] = new I.Proxy(args[1], { get(object, key) {
-              try { return I.Reflect.get(object, key, object); }
-              catch (error) { optionGetterThrew = true; throw error; }
-            } });
+            patchedArgs[1] = I.optionProxy(args[1], { onError: () => { optionGetterThrew = true; } });
           }
           try { return I.nativeConstruct(NativeWorker, patchedArgs, target); }
           catch (error) {
@@ -3569,11 +3621,9 @@
           const absoluteUrl = cacheKey;
           // Cache the type read so a native dictionary conversion doesn't invoke
           // a page's getter twice. SharedWorker's string-name overload stays intact.
-          const type = options && options.type;
+          const type = options && I.nativeGet(I.ObjectCtor(options), "type");
           if (options && typeof options === "object") {
-            args[1] = new I.Proxy(options, { get(object, key) {
-              return key === "type" ? type : I.Reflect.get(object, key, object);
-            } });
+            args[1] = I.optionProxy(options, { hasType: true, type });
           }
           const payload = buildWorkerPayload(absoluteUrl);
           if (type === "module") {
