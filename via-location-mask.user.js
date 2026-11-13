@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.12
+// @version      1.0.13
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -474,7 +474,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.12";
+  const VERSION = "1.0.13";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";
@@ -1865,17 +1865,15 @@
       }
 
       const watchId = nextWatchId++;
-      const record = { active: true, timer: 0 };
+      const record = { active: true, timer: 0, delivery: 0 };
       I.Mapset(syntheticWatches, watchId, record);
 
+      // The timer invokes the bound callback directly, like a browser task, so
+      // a throwing callback is reported natively with no script frames below it
+      // and the watch keeps firing. Scheduling stays on a separate timer.
       const emit = () => {
         if (!record.active || !protectionActive()) return;
-        try {
-          success(freshPosition());
-        } catch (callbackError) {
-          if (typeof realm.reportError === "function") realm.reportError(callbackError);
-          else I.setTimeout(() => { throw callbackError; }, 0);
-        }
+        record.delivery = I.setTimeout(I.bind(success, undefined, freshPosition()), 0);
       };
       const schedule = () => {
         if (!record.active || !protectionActive()) return;
@@ -1892,6 +1890,7 @@
       const stop = () => {
         record.active = false;
         I.clearTimeout(record.timer);
+        I.clearTimeout(record.delivery);
         I.Mapdelete(syntheticWatches, watchId);
       };
       record.stop = stop;

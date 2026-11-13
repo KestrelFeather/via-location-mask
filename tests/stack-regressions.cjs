@@ -162,6 +162,35 @@ function verify(actual,expected){
     const actual=await withPage(true,run);assert.deepEqual(actual,await withPage(false,run));
     assert.equal(actual.sameError,true);assert.equal(actual.hookCalls,0);
   });
+  // Headless Chromium has no real position to compare with, so assert the native
+  // shape directly: the browser invokes a watch callback from its own task, so a
+  // thrown error is reported with only the callback frame, and watching continues.
+  for(const child of [false,true])for(const named of [false,true])await check(`${child?'iframe':'window'} ${named?'named':'anonymous'} watchPosition callback errors report like a browser task`,()=>withPage(true,async page=>{
+    const result=await page.evaluate(child=>{
+      let realm=window;if(child){const frame=document.createElement('iframe');document.body.appendChild(frame);realm=frame.contentWindow}
+      return realm.eval(`new Promise(resolve=>{
+        const thrown=[],reported=[];let calls=0;
+        const onError=event=>{reported.push(event.error);event.preventDefault()};
+        addEventListener('error',onError);
+        const id=navigator.geolocation.watchPosition(function watchCallback(){calls++;const error=new TypeError('watch '+calls);thrown.push(error);throw error});
+        setTimeout(()=>{
+          navigator.geolocation.clearWatch(id);const atClear=calls;
+          setTimeout(()=>{
+            removeEventListener('error',onError);
+            resolve({atClear,afterClear:calls,same:reported.length===thrown.length&&reported.every((error,index)=>error===thrown[index]),
+              stacks:reported.map(error=>error.stack.split('\\n').slice(1).map(line=>line.trim()))});
+          },2500);
+        },2600);
+      })\n//# sourceURL=page-watch-errors.js`);
+    },child);
+    assert.ok(result.atClear>=2,'watch stopped after a throwing callback: '+result.atClear);
+    assert.equal(result.afterClear,result.atClear,'clearWatch left a pending delivery');
+    assert.equal(result.same,true);
+    for(const frames of result.stacks){
+      assert.equal(frames.length,1,frames.join(' | '));
+      assert.match(frames[0],/^at watchCallback \(page-watch-errors\.js:\d+:\d+\)$/);
+    }
+  },named));
   for(const child of [false,true])await check(`${child?'iframe':'window'} early stack read retains identity but is cleaned on escape`,async()=>{
     const run=page=>page.evaluate(child=>{
       let realm=window;if(child){const frame=document.createElement('iframe');document.body.appendChild(frame);realm=frame.contentWindow}

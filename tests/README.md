@@ -17,6 +17,14 @@ node tests/stack-regressions.cjs
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
 
+## v1.0.13 验证结果
+
+实际浏览器：Chromium 153（Playwright 自带）。扩展后的 `stack-regressions.cjs` 30/30；其余七套为 3/3、4/4、8/8、32/32、15/15、24/24、34/34，共 150 组通过。语法检查通过；使用 `VLM_SKIP_BENCH=1`。
+
+- 新增 4 组 `watchPosition` 回调异常回归：窗口/iframe × 具名/匿名注入。无头浏览器没有真实定位可供原生对照，因此直接断言原生形态：错误由浏览器任务上报、`event.error` 与回调抛出的对象相同、堆栈只有 `watchCallback` 一帧，回调抛错后至少继续推送一次，`clearWatch` 之后不再推送。
+- `VLM_SOURCE` 指向 v1.0.12（`f0e77fe`）时，新增 4 组全部失败（堆栈含 `emit` 与定时器帧）；修复后通过。
+- iframe 中的回调异常上报到回调所属 iframe 的 `error` 事件，与定时器挂在哪个窗口无关（Chromium 按回调函数的 realm 上报）。
+
 ## v1.0.12 验证结果
 
 实际浏览器：Edge 157.0.4341.46。扩展后的 `stack-regressions.cjs` 26/26；其余七套为 8/8、4/4、3/3、24/24、15/15、32/32、34/34，共 146 组通过。语法检查及 `git diff --check` 通过；本轮 review 套件使用 `VLM_SKIP_BENCH=1`，保留 DOM 调用计数断言。
