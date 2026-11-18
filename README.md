@@ -30,7 +30,7 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 跨域 iframe 和 Service Worker 无法覆盖，URL Worker 为实验性功能。
 - Temporal、SharedWorker 仅在浏览器原生提供时包装，不会为不支持的 WebView 添加 API。同一注入实例管理的 SharedWorker 连接复用替换后的 URL；不同标签页或独立注入实例之间的共享身份无法保证。
 - iframe 的同步覆盖发生在 DOM 插入方法返回前；不保证覆盖 HTML 解析器或插入过程中已经执行的子页面脚本。MutationObserver 和 load 监听继续作为补充。
-- 强制 Trusted Types 的页面（包括 Cloudflare 质询页）上，Worker 退回原生环境，Worker 里的时区与页面伪装时区不一致，可被比对出来。若某个网站仍无法通过 Cloudflare 质询，可将其加入排除列表；托管质询会把 `cf_clearance` 与 IP 绑定，伪装时区与 VPN 出口所在地区不一致也可能触发更严格的质询，建议使用 VPN 出口同步。
+- 强制 Trusted Types 的页面（包括 Cloudflare 质询页）上，Worker 退回原生环境，Worker 里的时区与页面伪装时区不一致，可被比对出来。若某个网站无法通过 Cloudflare 质询，可将应用模式切换为“除匹配列表外的网站”，并添加 `challenges.cloudflare.com`（Turnstile 质询 frame）及该网站本身（托管质询过渡页与网站同址）；“所有网站”模式不读取规则列表。被排除的页面仍安装包装函数，但全部按原生行为返回。托管质询会把 `cf_clearance` 与 IP 绑定，伪装时区与 VPN 出口所在地区不一致也可能触发更严格的质询，建议使用 VPN 出口同步。
 - 强制 Trusted Types 的页面拒绝补丁 Blob URL 时，会用页面原始参数创建 Worker，以保留网站功能；该 Worker 使用原生环境，不保证时区/语言伪装。脚本不会创建宽松的 Trusted Types policy。
 - Trusted Types 回退会再次转换原始 Worker 选项，因此成功的选项 getter 可能执行两次；getter 自己抛出的异常直接返回页面，不重试。
 - Via 没有扩展后台任务；VPN 自动同步只在至少一个网页标签运行时工作。
@@ -52,9 +52,15 @@ https://raw.githubusercontent.com/KestrelFeather/via-location-mask/main/via-loca
 - 第三方服务会收到正常网络连接附带的来源 IP，并处理相应查询词、坐标或待查询 IP。请同时查看各服务自己的条款与隐私政策。
 - 本项目没有自己的上报服务器；项目自身只在 Via 的脚本存储中持久化设置、缓存，以及用于识别重复注入的最近 200 个页面标记（网址与加载时间的哈希值，不保存网址本身）。
 
+## v1.0.15 修复
+
+- 撤销 v1.0.14 的自动跳过。v1.0.14 只要在导航响应的 Server-Timing 中看到 `chlray` 就在读取设置前退出，而这个名字由响应方自行设置，任何站点都能借此让已启用的保护静默失效：恢复原生时区、菜单和界面消失，定位回到浏览器原生权限流程，已有定位授权的站点可能取得真实位置。`challenges.cloudflare.com` 的硬编码跳过虽然无法被其他站点伪造，同样绕过了用户设置的保护范围，一并移除。
+- 是否在 Cloudflare 质询页停用保护，改由用户通过排除列表决定（见“重要限制”）。v1.0.14 的顶层界面限制和 Trusted Types 兼容界面保持不变。
+- `tests/challenge-regressions.cjs` 改为 6 组：发送 `chlray` 的站点仍受保护（时区、界面、定位权限与坐标均为伪装值），`challenges.cloudflare.com` 遵循默认的“所有网站”范围，排除列表可以为该 frame 停用保护。前两组在 v1.0.14 上失败。九套回归共 156 组通过（Chromium 153）。
+
 ## v1.0.14 修复（Cloudflare 质询）
 
-- 不在 Cloudflare 质询文档中运行：`challenges.cloudflare.com` 下的 Turnstile frame，以及带 `chlray` Server-Timing 的托管质询过渡页（"Just a moment…"）。质询只做浏览器指纹检查、不使用位置，伪装在这里没有收益，任何可察觉的痕迹都会导致质询失败。质询通过后加载的网站页面是新文档，照常受保护。
+- （已在 v1.0.15 撤销）不在 Cloudflare 质询文档中运行：`challenges.cloudflare.com` 下的 Turnstile frame，以及带 `chlray` Server-Timing 的托管质询过渡页（"Just a moment…"）。质询只做浏览器指纹检查、不使用位置，伪装在这里没有收益，任何可察觉的痕迹都会导致质询失败。质询通过后加载的网站页面是新文档，照常受保护。
 - 菜单、VPN 自动检查、浮动入口和首次引导只在顶层窗口运行，不再注入 Turnstile 等第三方小部件 frame。
 - 浮动入口和首次引导改用 DOM 节点构建，不再给 ShadowRoot 赋值 HTML 字符串；在强制 Trusted Types 的页面（包括 Cloudflare 质询页）上不再抛出未捕获的 TypeError，也不产生 CSP 违规报告。用户从菜单打开的设置面板在这类页面上改用脚本自己的 policy 渲染。
 - 新增 `tests/challenge-regressions.cjs` 5 组；v1.0.13 上 4 组失败。九套回归共 155 组通过（Chromium 153）。**尚未对真实 Cloudflare 质询做 A/B 实测**（本次运行环境无法访问 Cloudflare）；`chlray` 识别基于 Cloudflare 质询响应的 Server-Timing 头，需在 Via/Android 上确认。

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Via Location Mask
 // @namespace    https://kestrelfeather.com/via-location-mask
-// @version      1.0.14
+// @version      1.0.15
 // @description  Site-scoped geolocation, locale and timezone protection for Via Browser.
 // @author       Via Location Mask contributors
 // @license      MIT
@@ -59,28 +59,6 @@
 
 (function () {
   "use strict";
-
-  // Cloudflare challenges (the Turnstile frame on challenges.cloudflare.com and
-  // the managed-challenge interstitial, which carries a `chlray` Server-Timing
-  // entry) only fingerprint the browser and never use a location. Spoofing has
-  // no benefit there and any detectable trace fails the challenge, so the
-  // script stays out of those documents. The page loaded after the challenge
-  // passes is a new document and is protected as usual.
-  if (isCloudflareChallenge()) return;
-
-  function isCloudflareChallenge() {
-    try {
-      if (location.hostname === "challenges.cloudflare.com") return true;
-      const entries = performance.getEntriesByType("navigation");
-      const timings = entries.length ? entries[0].serverTiming : null;
-      for (let index = 0; timings && index < timings.length; index++) {
-        if (timings[index].name === "chlray") return true;
-      }
-    } catch (_) {
-      // Without the timing data, fall through to the normal patching path.
-    }
-    return false;
-  }
 
   // Private, startup-only snapshot. Never pass this object to page callbacks.
   // The same factory is serialized into workers before their scripts execute.
@@ -496,7 +474,7 @@
 
   const I = captureIntrinsics(globalThis);
 
-  const VERSION = "1.0.14";
+  const VERSION = "1.0.15";
   const STORAGE_KEY = "via-location-mask.settings.v1";
   const NETWORK_KEY = "via-location-mask.network.v1";
   const UI_STATE_KEY = "via-location-mask.ui.v1";

@@ -18,6 +18,14 @@ node tests/challenge-regressions.cjs
 
 可设置 `BROWSER_PATH` 使用已有 Chromium/Edge 可执行文件；已有 Playwright 安装也可以通过 `NODE_PATH` 引入。日期对照需要完整 Git 克隆中保留 v1.0.4 提交 `c8c25c0`。
 
+## v1.0.15 验证结果
+
+实际浏览器：Chromium 153（Playwright 自带）。`challenge-regressions.cjs` 6/6；其余八套 30/30、3/3、4/4、8/8、32/32、15/15、24/24、34/34，共 156 组通过。使用 `VLM_SKIP_BENCH=1`。
+
+- 发送 `Server-Timing: chlray` 的普通测试站点保持保护：伪装时区、菜单和浮动入口存在，`permissions.query` 为伪装的 `granted`，`getCurrentPosition` 返回伪装坐标。
+- `challenges.cloudflare.com` 文档在默认“所有网站”模式下仍伪装；切换为排除列表并加入该域名后恢复原生时区，其他站点仍伪装。
+- `VLM_SOURCE` 指向 v1.0.14（`a39caaa`）时，前两组失败，复现自动跳过导致的保护失效。
+
 ## v1.0.14 验证结果
 
 实际浏览器：Chromium 153（Playwright 自带）。新增 `challenge-regressions.cjs` 5/5；其余八套 30/30、3/3、4/4、8/8、32/32、15/15、24/24、34/34，共 155 组通过。使用 `VLM_SKIP_BENCH=1`。
